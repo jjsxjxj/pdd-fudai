@@ -1105,6 +1105,12 @@ details[open] summary::before{content:"▾ "}
 .action-btn:active{transform:scale(.96)}
 .action-btn:disabled{opacity:.5;cursor:not-allowed}
 
+/* 识图提取 */
+.ocr-btn{display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 24px;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;color:#fff;background:linear-gradient(135deg,#10b981,#059669);transition:all .2s ease;white-space:nowrap;box-sizing:border-box;min-width:120px;box-shadow:0 4px 12px rgba(16,185,129,.3)}
+.ocr-btn:hover{transform:translateY(-2px)}
+.ocr-btn:active{transform:scale(.96)}
+.ocr-btn:disabled{opacity:.5;cursor:not-allowed}
+
 /* 蜜罐 */
 .honeypot{position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden}
 
@@ -1180,7 +1186,7 @@ summary{font-size:14px}
 .instruction-list{font-size:13px}
 .input-area{flex-direction:column;align-items:stretch}
 .input-area input{width:100%;margin-bottom:10px}
-.submit-btn,.action-btn{width:100%;margin-bottom:10px;min-width:unset}
+.submit-btn,.action-btn,.ocr-btn{width:100%;margin-bottom:10px;min-width:unset}
 .list-item{flex-direction:column;gap:10px;align-items:flex-start;font-size:16px;padding:14px 16px}
 .list-item .actions{align-self:flex-end}
 .jump-btn{padding:8px 16px;font-size:14px}
@@ -1248,6 +1254,8 @@ summary{font-size:14px}
       <input type="tel" id="codeInput" placeholder="输入8-9位邀请码" maxlength="9" inputmode="numeric" pattern="[0-9]*" oninput="this.value=this.value.replace(/\D/g,'')">
       <input type="text" id="websiteField" style="display:none" tabindex="-1" autocomplete="off">
       <button class="submit-btn" id="submitBtn" onclick="submitCode()">立即提交</button>
+      <button class="ocr-btn" id="ocrBtn" onclick="document.getElementById('ocrFile').click()">📷 识图提取</button>
+      <input type="file" id="ocrFile" accept="image/*" style="display:none" onchange="handleOcrFile(this)">
       <button class="action-btn" id="smartBtn" onclick="quickUse()">🚀 智能直达</button>
     </div>
 
@@ -1351,6 +1359,68 @@ async function submitCode() {
 function getMyUsed() {
   try { return JSON.parse(localStorage.getItem('pdd_my_used') || '[]'); } catch(e) { return []; }
 }
+
+/* ============ 识图提取（本地 OCR，图片不上传服务器） ============ */
+
+/** 按需加载 Tesseract.js（CDN） */
+function loadOcrScript() {
+  if (window.Tesseract) return Promise.resolve();
+  return new Promise(function(resolve, reject) {
+    var s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+    s.onload = resolve;
+    s.onerror = function() { reject(new Error('OCR 组件加载失败，请检查网络')); };
+    document.head.appendChild(s);
+  });
+}
+
+/** 选择图片后识别，提取 8-9 位纯数字互助码 */
+async function handleOcrFile(fileEl) {
+  var file = fileEl.files && fileEl.files[0];
+  fileEl.value = ''; // 允许重复选择同一张图
+  if (!file) return;
+
+  var btn = document.getElementById('ocrBtn');
+  var input = document.getElementById('codeInput');
+  var oldText = btn.textContent;
+  btn.disabled = true;
+
+  try {
+    btn.textContent = '组件加载中...';
+    await loadOcrScript();
+
+    btn.textContent = '识别中...';
+    var worker = await Tesseract.createWorker('eng', 1, {
+      logger: function(m) {
+        if (m.status === 'recognizing text' && m.progress) {
+          btn.textContent = '识别中 ' + Math.round(m.progress * 100) + '%';
+        }
+      }
+    });
+    await worker.setParameters({ tessedit_char_whitelist: '0123456789' });
+
+    var result = await worker.recognize(file);
+    await worker.terminate();
+
+    // 从识别文本中提取 8-9 位数字串
+    var text = (result.data.text || '').replace(/\\s+/g, '');
+    var match = text.match(/\\d{8,9}/);
+
+    if (match) {
+      input.value = match[0];
+      showToast('识别成功，请确认后提交', 'success');
+      input.focus();
+    } else {
+      showToast('未识别到 8-9 位数字互助码，请换清晰截图重试', 'error');
+    }
+  } catch(e) {
+    showToast('识别失败：' + (e && e.message ? e.message : '未知错误'), 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
 /** 记录自己用过的码 id */
 function addMyUsed(id) {
   var list = getMyUsed();
