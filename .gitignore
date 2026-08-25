@@ -1,0 +1,16 @@
+# 排除脚本与压测产物（不上传）
+scripts/
+
+# 视频素材不上传（体积大，仅保留在网盘）
+video/
+
+# 技能教程不入库
+SKILL-GUIDE.md
+
+# Wrangler 本地状态
+.wrangler/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+node_modules/

@@ -1,0 +1,14 @@
+{
+  "name": "pdd-fudai",
+  "version": "1.0.0",
+  "description": "PDD福袋互助平台 - Cloudflare Workers 版",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute pdd-fudai-db --file=schema.sql",
+    "db:init:remote": "wrangler d1 execute pdd-fudai-db --remote --file=schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,23 @@
+name = "pdd-fudai"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# 自定义域名路由
+routes = [
+  { pattern = "fudai.10087.eu.org/*", zone_id = "YOUR_ZONE_ID" }
+]
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "pdd-fudai-db"
+database_id = "YOUR_DATABASE_ID"
+
+# 环境变量 - 通过 `wrangler secret put` 设置
+# ADMIN_KEY: 管理后台访问密钥
+# [vars]
+# ADMIN_KEY = "your-admin-key-here"
+
+# Cron Trigger: 每天 23:59 CST (15:59 UTC) 自动清空互助码
+[triggers]
+crons = ["59 15 * * *"]
