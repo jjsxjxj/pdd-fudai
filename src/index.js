@@ -196,9 +196,9 @@ async function handleGetConfig(db) {
   // 智能直达开关：默认开启
   data.smart_enabled = smartRaw !== 'off';
 
-  // OCR 模式：auto（AI优先，被限自动切本地）/ ai（仅服务端）/ local（仅浏览器本地），默认 auto
+  // OCR 模式：local（默认，浏览器本地优先）/ ai（仅服务端 AI），默认 local
   const ocrModeRaw = await getSetting(db, 'ocr_mode');
-  data.ocr_mode = (ocrModeRaw === 'ai' || ocrModeRaw === 'local') ? ocrModeRaw : 'auto';
+  data.ocr_mode = (ocrModeRaw === 'ai') ? 'ai' : 'local';
 
   // 今日统计（按中国时区 CST UTC+8 算今日 0:00，与前端列表展示日期一致）
   // Cloudflare Workers 的 Date 是 UTC 直接 setHours 会算成 UTC 0:00（=CST 8:00），
@@ -736,8 +736,8 @@ async function handleAdminGetSettings(db) {
   const refreshInterval = (await getSetting(db, 'refresh_interval')) || '5';
   const rateLimitMax = (await getSetting(db, 'rate_limit_max')) || String(CONFIG.RATE_LIMIT_MAX);
   const dailyLimit = (await getSetting(db, 'daily_limit')) || String(CONFIG.DAILY_LIMIT);
-  const ocrModeRaw = (await getSetting(db, 'ocr_mode')) || 'auto';
-  const ocrMode = (ocrModeRaw === 'ai' || ocrModeRaw === 'local') ? ocrModeRaw : 'auto';
+  const ocrModeRaw = (await getSetting(db, 'ocr_mode')) || 'local';
+  const ocrMode = (ocrModeRaw === 'ai') ? 'ai' : 'local';
   let ads = [];
   try {
     ads = JSON.parse(adsRaw);
@@ -809,8 +809,8 @@ async function handleAdminSaveSettings(db, request) {
     }
   }
 
-  // OCR 模式：auto / ai / local
-  if (body.ocr_mode === 'ai' || body.ocr_mode === 'local' || body.ocr_mode === 'auto') {
+  // OCR 模式：ai（仅服务端）/ local（浏览器本地优先）
+  if (body.ocr_mode === 'ai' || body.ocr_mode === 'local') {
     await setSetting(db, 'ocr_mode', body.ocr_mode);
   }
 
@@ -856,13 +856,21 @@ async function handleAdminDeleteReport(db, id) {
   return json({ success: true, message: '已删除' });
 }
 
-/** POST /api/ocr — 上传图片，用 Cloudflare Workers AI 视觉模型提取互助码
- *  ocr_mode: auto(默认, AI优先, 被限自动切本地) / ai(仅服务端) / local(仅浏览器本地)
+/** POST /api/ocr — 互助码识别接口（AI 路径）
+ *  ocr_mode: local(默认, 由前端浏览器本地识别, 后端返回 fallback) / ai(仅服务端AI识别)
+ *  前端默认走浏览器本地识别；用户选择「用AI识别」时带 ?force=ai 调用本接口
  */
 async function handleOcr(request, env) {
-  const ip = getClientIP(request);
-  let ocrMode = 'auto';
   try {
+    // 支持 ?force=ai 强制走 AI（前端「用 AI 识别」按钮）
+    var forceAi = false;
+    try { forceAi = new URL(request.url).searchParams.get('force') === 'ai'; } catch(e) {}
+
+    // OCR 模式（auto / ai / local），force=ai 时强制为 ai
+    const ocrModeRaw = await getSetting(env.DB, 'ocr_mode');
+    let ocrMode = (ocrModeRaw === 'ai') ? 'ai' : 'local';
+    if (forceAi) ocrMode = 'ai';
+
     // 从 FormData 中读取图片
     const formData = await request.formData();
     const file = formData.get('image');
@@ -870,27 +878,10 @@ async function handleOcr(request, env) {
       return json({ success: false, error: '未收到图片' }, 400);
     }
 
-    // OCR 模式（auto / ai / local）
-    const ocrModeRaw = await getSetting(env.DB, 'ocr_mode');
-    ocrMode = (ocrModeRaw === 'ai' || ocrModeRaw === 'local') ? ocrModeRaw : 'auto';
-
     // local 模式：不消耗 AI 额度，直接让前端用浏览器本地识别
     if (ocrMode === 'local') {
       return json({ success: false, fallback: 'local', error: '请使用浏览器本地识别' });
     }
-
-    // 限流：每 IP 每天最多 10 次 AI 识别（防刷，避免一人耗光全站每日额度）
-    const OCR_DAILY = 10;
-    const cstShift = 8 * 3600_000;
-    const cstOfNow = new Date(Date.now() + cstShift);
-    cstOfNow.setUTCHours(0, 0, 0, 0);                       // CST 今日 0:00
-    const todayISO = new Date(cstOfNow.getTime() - cstShift).toISOString();
-    const used = await env.DB.prepare("SELECT COUNT(*) as c FROM submit_logs WHERE ip = ? AND action = 'ocr' AND created_at > ?").bind(ip, todayISO).first();
-    console.error('OCR LIMIT DEBUG ip=', ip, 'todayISO=', todayISO, 'used=', JSON.stringify(used), 'OCR_DAILY=', OCR_DAILY);
-    if (used && used.c >= OCR_DAILY) {
-      return json({ success: false, error: '今日识别次数已达上限，请手动输入互助码' }, 429);
-    }
-    await env.DB.prepare("INSERT INTO submit_logs (ip, code, action, created_at) VALUES (?, ?, 'ocr', ?)").bind(ip, null, now()).run();
 
     // 转为 base64 传给 AI 模型（llama-3.2 vision 支持 messages 格式的 image_url）
     const imageBuffer = await file.arrayBuffer();
@@ -994,15 +985,13 @@ async function handleOcr(request, env) {
   } catch(e) {
     console.error('handleOcr error:', e);
     const msg = String(e && e.message ? e.message : e);
-    // 额度/限流类错误（429 / quota / neuron / rate limit / capacity 等）
     const isQuota = /429|quota|rate.?limit|exceed|neuron|too many|capacity|rest/i.test(msg);
-    if (isQuota && ocrMode === 'auto') {
-      return json({ success: false, fallback: 'local', error: 'AI 识别额度已用完，请用浏览器本地识别或手动输入互助码' });
+    if (ocrMode === 'auto') {
+      // auto：AI 失败（含额度受限）一律静默切本地
+      return json({ success: false, fallback: 'local', error: isQuota ? 'AI 额度受限，已切换浏览器本地识别' : 'AI 识别失败，已切换浏览器本地识别' });
     }
-    if (isQuota) {
-      return json({ success: false, error: '识别额度已用完，请手动输入互助码' });
-    }
-    return json({ success: false, error: '识别出错，请手动输入互助码' });
+    // ai 模式（含 force=ai）：额度受限或出错都友好提示手动输入
+    return json({ success: false, error: '抱歉，识别出错，请手动输入互助码' });
   }
 }
 
@@ -1148,7 +1137,6 @@ async function dailyCleanup(db) {
   await db.prepare("DELETE FROM codes").run();
   // 更新清理日期
   await db.prepare("INSERT INTO settings (key, value, updated_at) VALUES ('last_cleanup_date', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").bind(today, now()).run();
-  console.log('[dailyCleanup] 已清空所有互助码，日期:', today);
   return true;
 }
 
@@ -1418,7 +1406,7 @@ summary{font-size:14px}
 
     <!-- 输入区 -->
     <div class="input-area">
-      <input type="tel" id="codeInput" placeholder="输入8-9位邀请码" maxlength="9" inputmode="numeric" pattern="[0-9]*" oninput="this.value=this.value.replace(/\D/g,'')">
+      <input type="tel" id="codeInput" placeholder="输入8-9位邀请码" maxlength="9" inputmode="numeric" pattern="[0-9]*" oninput="this.value=this.value.replace(/\\D/g,'')">
       <input type="text" id="websiteField" style="display:none" tabindex="-1" autocomplete="off">
       <button class="submit-btn" id="submitBtn" onclick="submitCode()">立即提交</button>
       <button class="ocr-btn" id="ocrBtn" onclick="document.getElementById('ocrFile').click()">📷 识图提取</button>
@@ -1546,30 +1534,46 @@ async function handleOcrFile(fileEl) {
   var oldText = btn.textContent;
   btn.disabled = true;
 
-  // 模式：local 直接用浏览器本地；auto/ai 先走后端 AI
-  var mode = window._ocrMode || 'auto';
+  // 后台模式：ai = 直接走服务端 AI；local/auto（默认）= 浏览器本地优先
+  var mode = window._ocrMode || 'local';
   try {
-    if (mode === 'local') {
-      return await localOcr(file, btn, input);
+    if (mode === 'ai') {
+      return await aiOcr(file, btn, input);
     }
-    btn.textContent = 'AI 识别中...';
-    var formData = new FormData();
-    formData.append('image', file);
-    var res = await fetch('/api/ocr', { method: 'POST', body: formData });
-    var data = await res.json();
-    if (data.success && data.code) {
-      fillOcrResult(input, data.code);
-    } else if (data.fallback === 'local') {
-      // 后端说 AI 额度用完，前端切本地识别
-      return await localOcr(file, btn, input);
-    } else {
-      showToast(data.error || '未识别到互助码，请手动输入', 'error');
+    // 本地优先
+    btn.textContent = '本地识别中...';
+    var code = await runLocalOcr(file, btn);
+    if (code) {
+      fillOcrResult(input, code);
+      return;
     }
+    // 本地未识别到：弹窗让用户选「用 AI 识别」或「手动输入」
+    var choice = await showOcrFallbackDialog();
+    if (choice === 'ai') {
+      return await aiOcr(file, btn, input);
+    }
+    showToast('请手动输入互助码', 'error');
   } catch(e) {
     showToast('识别出错，请手动输入互助码', 'error');
   } finally {
     btn.disabled = false;
     btn.textContent = oldText;
+  }
+}
+
+/** 调用服务端 AI 识别（?force=ai 保证走 AI 路径） */
+async function aiOcr(file, btn, input) {
+  btn.textContent = 'AI 识别中...';
+  var formData = new FormData();
+  formData.append('image', file);
+  var res = await fetch('/api/ocr?force=ai', { method: 'POST', body: formData });
+  var data = await res.json();
+  if (data.success && data.code) {
+    fillOcrResult(input, data.code);
+  } else if (data.fallback === 'local') {
+    showToast('AI 识别受限，请手动输入互助码', 'error');
+  } else {
+    showToast(data.error || 'AI 识别失败，请手动输入互助码', 'error');
   }
 }
 
@@ -1584,33 +1588,65 @@ function fillOcrResult(input, code) {
   input.focus();
 }
 
-/** 浏览器本地 OCR（tesseract.js + 红底白字预处理，纯前端不消耗 AI 额度） */
+/** 浏览器本地 OCR（tesseract.js + 红底白字预处理），返回识别到的码或 null */
 var _ocrWorker = null;
-async function localOcr(file, btn, input) {
+async function runLocalOcr(file, btn) {
   if (!window.Tesseract) {
     showToast('本地识别组件未加载，请手动输入互助码', 'error');
-    return;
+    return null;
+  }
+  if (!_ocrWorker) {
+    btn.textContent = '加载识别模型...';
+    try {
+      // 强制使用 best 训练数据，与本地 Node 实验保持一致
+      _ocrWorker = await Tesseract.createWorker('eng', 1, {
+        langPath: 'https://tessdata.projectnaptha.com/4.0.0_best'
+      });
+      await _ocrWorker.setParameters({ tessedit_char_whitelist: '0123456789' });
+    } catch(e) {
+      console.error('本地识别模型加载失败:', e);
+      showToast('本地识别模型加载失败，请手动输入或改用 AI', 'error');
+      return null;
+    }
   }
   btn.textContent = '本地识别中...';
   try {
     var canvas = await preprocessImageForOcr(file);
-    if (!_ocrWorker) {
-      btn.textContent = '加载识别模型...';
-      _ocrWorker = await Tesseract.createWorker('eng');
-      await _ocrWorker.setParameters({ tessedit_char_whitelist: '0123456789' });
-    }
-    btn.textContent = '本地识别中...';
     var result = await _ocrWorker.recognize(canvas);
-    var code = extractCodeFromText(result.data.text || '');
-    if (code) {
-      fillOcrResult(input, code);
-    } else {
-      // 本地未识别到：友好提示手动输入（本地模式不弹额度提示）
-      showToast('本地未识别到互助码，请手动输入', 'error');
-    }
+    var rawText = result.data.text || '';
+    return extractCodeFromText(rawText);
   } catch(e) {
-    showToast('本地识别出错，请手动输入互助码', 'error');
+    console.error('本地识别出错:', e);
+    showToast('本地识别出错：' + (e && e.message ? e.message : '未知错误'), 'error');
+    return null;
   }
+}
+
+/** 本地识别失败后的选择弹窗：返回 'ai' 或 'manual' */
+function showOcrFallbackDialog() {
+  return new Promise(function(resolve) {
+    var overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:9999;';
+    var box = document.createElement('div');
+    box.style.cssText = 'background:#fff;border-radius:12px;padding:24px;max-width:320px;width:86%;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.2);';
+    var title = document.createElement('div');
+    title.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:6px;';
+    title.textContent = '本地未识别到互助码';
+    var sub = document.createElement('div');
+    sub.style.cssText = 'font-size:13px;color:#666;margin-bottom:18px;';
+    sub.textContent = '可改用 AI 识别，或直接手动输入互助码';
+    var aiBtn = document.createElement('button');
+    aiBtn.textContent = '用 AI 识别';
+    aiBtn.style.cssText = 'display:block;width:100%;padding:11px;margin-bottom:10px;border:none;border-radius:8px;background:#ff5000;color:#fff;font-size:14px;cursor:pointer;';
+    var manualBtn = document.createElement('button');
+    manualBtn.textContent = '手动输入';
+    manualBtn.style.cssText = 'display:block;width:100%;padding:11px;border:1px solid #ddd;border-radius:8px;background:#fff;color:#333;font-size:14px;cursor:pointer;';
+    aiBtn.onclick = function () { document.body.removeChild(overlay); resolve('ai'); };
+    manualBtn.onclick = function () { document.body.removeChild(overlay); resolve('manual'); };
+    box.appendChild(title); box.appendChild(sub); box.appendChild(aiBtn); box.appendChild(manualBtn);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+  });
 }
 
 /** 红底白字 → 黑字白底预处理（拼多多分享图），提升数字识别率 */
@@ -1650,13 +1686,33 @@ function preprocessImageForOcr(file) {
   });
 }
 
-/** 从文本中提取连续 8/9 位数字（兜底取最长 6-12 位） */
+/** 从文本中提取连续 8/9 位数字（兜底取最长 6-12 位）
+ *  注意：这段代码在 INDEX_HTML 模板里，不能写 \d 等正则转义，会被模板吞掉反斜杠。
+ */
 function extractCodeFromText(text) {
-  var nums = (text.match(/\d+/g) || []);
-  var valid = nums.filter(function(n) { return n.length === 8 || n.length === 9; });
-  if (valid.length) return valid[0];
-  if (nums.length) {
-    var longest = nums.reduce(function(a, b) { return b.length > a.length ? b : a; });
+  var s = String(text || '');
+  var runs = [];
+  var cur = '';
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charAt(i);
+    if (c >= '0' && c <= '9') {
+      cur += c;
+    } else if (cur.length) {
+      runs.push(cur);
+      cur = '';
+    }
+  }
+  if (cur.length) runs.push(cur);
+
+  // 优先取 8-9 位数字串
+  for (var j = 0; j < runs.length; j++) {
+    var len = runs[j].length;
+    if (len >= 8 && len <= 9) return runs[j];
+  }
+
+  // 兜底：最长 6-12 位数字串
+  if (runs.length) {
+    var longest = runs.reduce(function(a, b) { return b.length > a.length ? b : a; });
     if (longest.length >= 6 && longest.length <= 12) return longest;
   }
   return null;
@@ -1971,7 +2027,7 @@ async function loadConfig() {
     }
 
     // OCR 模式：存全局，识图时决定用 AI 还是浏览器本地
-    window._ocrMode = (cfg.ocr_mode === 'ai' || cfg.ocr_mode === 'local') ? cfg.ocr_mode : 'auto';
+    window._ocrMode = (cfg.ocr_mode === 'ai') ? 'ai' : 'local';
   } catch(e) {
     // 配置加载失败静默处理，不影响主功能
   }
@@ -2157,11 +2213,10 @@ tr:hover{background:#fafafa}
       <div class="form-group">
         <label>识图提取模式</label>
         <select id="ocrModeInput" style="width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:8px;font-size:14px">
-          <option value="auto">自动（AI优先，额度用完自动切浏览器本地）</option>
+          <option value="local">浏览器本地优先（默认，不消耗 AI 额度）</option>
           <option value="ai">仅服务端 AI（额度用完提示手动输入）</option>
-          <option value="local">仅浏览器本地（不消耗 AI 额度）</option>
         </select>
-        <div class="hint">自动模式：默认用 AI 识别，遇到额度限制自动改用浏览器本地识别。本地模式不消耗每日约 347 次的 AI 额度，但首次需下载识别组件（约 10MB）。</div>
+        <div class="hint">本地优先：选图后先用浏览器本地识别（首次需下载组件约 10MB），失败会弹窗让你选「用 AI 识别」或「手动输入」。设为「仅 AI」则不走本地、直接调用服务端识别。</div>
       </div>
     </div>
     <div style="margin-bottom:20px">
@@ -2325,7 +2380,7 @@ function loadSettings() {
     document.getElementById('refreshIntervalInput').value = data.data.refresh_interval || '5';
     document.getElementById('rateLimitMaxInput').value = data.data.rate_limit_max || '5';
     document.getElementById('dailyLimitInput').value = data.data.daily_limit || '30';
-    document.getElementById('ocrModeInput').value = (data.data.ocr_mode === 'ai' || data.data.ocr_mode === 'local') ? data.data.ocr_mode : 'auto';
+    document.getElementById('ocrModeInput').value = (data.data.ocr_mode === 'ai') ? 'ai' : 'local';
     var ads = data.data.ads || [];
     var container = document.getElementById('adsContainer');
     container.innerHTML = '';
