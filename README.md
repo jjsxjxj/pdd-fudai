@@ -4,6 +4,8 @@
 
 **线上地址**: https://fudai.10087.eu.org
 
+**部署教程**: [Cloudflare Workers 部署指南 - 我的博客](https://813146.xyz/post/deploy-cloudflare-workers-via-dashboard)
+
 ## 功能特性
 
 ### 核心功能
