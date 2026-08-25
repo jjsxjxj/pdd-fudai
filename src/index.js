@@ -196,6 +196,10 @@ async function handleGetConfig(db) {
   // 智能直达开关：默认开启
   data.smart_enabled = smartRaw !== 'off';
 
+  // OCR 模式：auto（AI优先，被限自动切本地）/ ai（仅服务端）/ local（仅浏览器本地），默认 auto
+  const ocrModeRaw = await getSetting(db, 'ocr_mode');
+  data.ocr_mode = (ocrModeRaw === 'ai' || ocrModeRaw === 'local') ? ocrModeRaw : 'auto';
+
   // 今日统计（按中国时区 CST UTC+8 算今日 0:00，与前端列表展示日期一致）
   // Cloudflare Workers 的 Date 是 UTC 直接 setHours 会算成 UTC 0:00（=CST 8:00），
   // 导致 0:00~8:00 (CST) 之间提交的码按日期显示算"今日"但 stats 不算，体验割裂。
@@ -732,6 +736,8 @@ async function handleAdminGetSettings(db) {
   const refreshInterval = (await getSetting(db, 'refresh_interval')) || '5';
   const rateLimitMax = (await getSetting(db, 'rate_limit_max')) || String(CONFIG.RATE_LIMIT_MAX);
   const dailyLimit = (await getSetting(db, 'daily_limit')) || String(CONFIG.DAILY_LIMIT);
+  const ocrModeRaw = (await getSetting(db, 'ocr_mode')) || 'auto';
+  const ocrMode = (ocrModeRaw === 'ai' || ocrModeRaw === 'local') ? ocrModeRaw : 'auto';
   let ads = [];
   try {
     ads = JSON.parse(adsRaw);
@@ -739,7 +745,7 @@ async function handleAdminGetSettings(db) {
   } catch {
     ads = [];
   }
-  return json({ success: true, data: { notice, ads, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartRaw, refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit } });
+  return json({ success: true, data: { notice, ads, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartRaw, refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit, ocr_mode: ocrMode } });
 }
 
 /** POST /api/admin/settings — 保存站点设置 */
@@ -803,6 +809,11 @@ async function handleAdminSaveSettings(db, request) {
     }
   }
 
+  // OCR 模式：auto / ai / local
+  if (body.ocr_mode === 'ai' || body.ocr_mode === 'local' || body.ocr_mode === 'auto') {
+    await setSetting(db, 'ocr_mode', body.ocr_mode);
+  }
+
   return json({ success: true, message: '设置已保存' });
 }
 
@@ -845,6 +856,156 @@ async function handleAdminDeleteReport(db, id) {
   return json({ success: true, message: '已删除' });
 }
 
+/** POST /api/ocr — 上传图片，用 Cloudflare Workers AI 视觉模型提取互助码
+ *  ocr_mode: auto(默认, AI优先, 被限自动切本地) / ai(仅服务端) / local(仅浏览器本地)
+ */
+async function handleOcr(request, env) {
+  const ip = getClientIP(request);
+  let ocrMode = 'auto';
+  try {
+    // 从 FormData 中读取图片
+    const formData = await request.formData();
+    const file = formData.get('image');
+    if (!file) {
+      return json({ success: false, error: '未收到图片' }, 400);
+    }
+
+    // OCR 模式（auto / ai / local）
+    const ocrModeRaw = await getSetting(env.DB, 'ocr_mode');
+    ocrMode = (ocrModeRaw === 'ai' || ocrModeRaw === 'local') ? ocrModeRaw : 'auto';
+
+    // local 模式：不消耗 AI 额度，直接让前端用浏览器本地识别
+    if (ocrMode === 'local') {
+      return json({ success: false, fallback: 'local', error: '请使用浏览器本地识别' });
+    }
+
+    // 限流：每 IP 每天最多 10 次 AI 识别（防刷，避免一人耗光全站每日额度）
+    const OCR_DAILY = 10;
+    const cstShift = 8 * 3600_000;
+    const cstOfNow = new Date(Date.now() + cstShift);
+    cstOfNow.setUTCHours(0, 0, 0, 0);                       // CST 今日 0:00
+    const todayISO = new Date(cstOfNow.getTime() - cstShift).toISOString();
+    const used = await env.DB.prepare("SELECT COUNT(*) as c FROM submit_logs WHERE ip = ? AND action = 'ocr' AND created_at > ?").bind(ip, todayISO).first();
+    console.error('OCR LIMIT DEBUG ip=', ip, 'todayISO=', todayISO, 'used=', JSON.stringify(used), 'OCR_DAILY=', OCR_DAILY);
+    if (used && used.c >= OCR_DAILY) {
+      return json({ success: false, error: '今日识别次数已达上限，请手动输入互助码' }, 429);
+    }
+    await env.DB.prepare("INSERT INTO submit_logs (ip, code, action, created_at) VALUES (?, ?, 'ocr', ?)").bind(ip, null, now()).run();
+
+    // 转为 base64 传给 AI 模型（llama-3.2 vision 支持 messages 格式的 image_url）
+    const imageBuffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(imageBuffer);
+    // 分块转 base64，避免 String.fromCharCode(...arr) 超出调用栈上限
+    let binStr = '';
+    const CHUNK = 8192;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binStr += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    const base64 = btoa(binStr);
+    const mimeType = file.type || 'image/png';
+
+    // 调用 Cloudflare Workers AI 视觉模型（llama-3.2-11b-vision-instruct）
+    // 使用 messages 格式，content 数组中包含 text 和 image_url
+    let aiResponse;
+    try {
+      aiResponse = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', {
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Look at this image carefully. It is from Pinduoduo (拼多多). There is an invitation code shown as a string of 8 or 9 digits (like 12345678 or 123456789). What is the invitation code? Reply with ONLY the digits, no other text.' },
+              { type: 'image_url', image_url: { url: 'data:' + mimeType + ';base64,' + base64 } }
+            ]
+          }
+        ],
+        max_tokens: 20,
+        temperature: 0.1,
+      });
+    } catch(e) {
+      var errStr = String(e.message || e);
+      // 如果需要 agree Meta License，先 agree 再重试
+      if (errStr.includes('agree') || errStr.includes('license') || errStr.includes('3016') || errStr.includes('5016')) {
+        try { await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', { prompt: 'agree' }); } catch(e2) {}
+        aiResponse = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', {
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'Look at this image carefully. It is from Pinduoduo (拼多多). There is an invitation code shown as a string of 8 or 9 digits (like 12345678 or 123456789). What is the invitation code? Reply with ONLY the digits, no other text.' },
+                { type: 'image_url', image_url: { url: 'data:' + mimeType + ';base64,' + base64 } }
+              ]
+            }
+          ],
+          max_tokens: 20,
+          temperature: 0.1,
+        });
+      } else {
+        throw e;
+      }
+    }
+
+    // 安全获取 AI 返回文本（不同格式兼容；response 可能是数字类型）
+    var rawText = '';
+    if (aiResponse) {
+      if (typeof aiResponse.response === 'string') {
+        rawText = aiResponse.response.trim();
+      } else if (typeof aiResponse.response === 'number') {
+        rawText = String(aiResponse.response);
+      } else if (aiResponse.message && typeof aiResponse.message.content === 'string') {
+        rawText = aiResponse.message.content.trim();
+      } else if (typeof aiResponse === 'string') {
+        rawText = aiResponse.trim();
+      }
+    }
+
+    // 清理 markdown 符号和空白，只留数字
+    var cleaned = rawText.replace(/[^0-9]/g, ' ');
+
+    // 优先提取连续的 8 或 9 位数字（用户要求：识别逻辑为连续八位或九位数）
+    var matches = cleaned.match(/\d{8,9}/g) || [];
+    // 排除超过 9 位的（如从更长数字串中切出来的），并去重
+    var valid = matches.filter(function(s) { return s.length === 8 || s.length === 9; });
+    if (valid.length > 0) {
+      var code = valid[0];
+      return json({
+        success: true,
+        code: code,
+        rawText: rawText.slice(0, 100),
+      });
+    }
+
+    // 兜底：无 8/9 位数字时，取最长的数字串（至少 6 位才认为可信）
+    var allNums = cleaned.match(/\d+/g) || [];
+    if (allNums.length > 0) {
+      var longest = allNums.sort(function(a, b) { return b.length - a.length; })[0];
+      if (longest.length >= 6 && longest.length <= 12) {
+        return json({
+          success: true,
+          code: longest,
+          rawText: rawText.slice(0, 100),
+        });
+      }
+    }
+
+    return json({
+      success: false,
+      error: '未识别到互助码，请手动输入或换清晰截图',
+    });
+  } catch(e) {
+    console.error('handleOcr error:', e);
+    const msg = String(e && e.message ? e.message : e);
+    // 额度/限流类错误（429 / quota / neuron / rate limit / capacity 等）
+    const isQuota = /429|quota|rate.?limit|exceed|neuron|too many|capacity|rest/i.test(msg);
+    if (isQuota && ocrMode === 'auto') {
+      return json({ success: false, fallback: 'local', error: 'AI 识别额度已用完，请用浏览器本地识别或手动输入互助码' });
+    }
+    if (isQuota) {
+      return json({ success: false, error: '识别额度已用完，请手动输入互助码' });
+    }
+    return json({ success: false, error: '识别出错，请手动输入互助码' });
+  }
+}
+
 // ============================================================
 //  路由分发
 // ============================================================
@@ -873,6 +1034,11 @@ async function handleAPI(request, env, path) {
 
   if (path === '/api/submit' && method === 'POST') {
     return handleSubmit(env.DB, request, ip);
+  }
+
+  // 识图提取（Cloudflare Workers AI 视觉模型）
+  if (path === '/api/ocr' && method === 'POST') {
+    return handleOcr(request, env);
   }
 
   // 智能直达
@@ -1036,6 +1202,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PDD福袋五折互助</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f8ff;color:#333;min-height:100vh;padding:20px}
@@ -1360,65 +1527,139 @@ function getMyUsed() {
   try { return JSON.parse(localStorage.getItem('pdd_my_used') || '[]'); } catch(e) { return []; }
 }
 
-/* ============ 识图提取（本地 OCR，图片不上传服务器） ============ */
+/* ============ 识图提取（Cloudflare Workers AI 视觉模型，服务端识别） ============ */
 
-/** 按需加载 Tesseract.js（CDN） */
-function loadOcrScript() {
-  if (window.Tesseract) return Promise.resolve();
-  return new Promise(function(resolve, reject) {
-    var s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
-    s.onload = resolve;
-    s.onerror = function() { reject(new Error('OCR 组件加载失败，请检查网络')); };
-    document.head.appendChild(s);
-  });
-}
-
-/** 选择图片后识别，提取 8-9 位纯数字互助码 */
+/** 选择图片后识别互助码（AI 或浏览器本地，按后台模式） */
 async function handleOcrFile(fileEl) {
   var file = fileEl.files && fileEl.files[0];
   fileEl.value = ''; // 允许重复选择同一张图
   if (!file) return;
+
+  // 限制图片大小（4MB）
+  if (file.size > 4 * 1024 * 1024) {
+    showToast('图片太大，请选小于 4MB 的截图', 'error');
+    return;
+  }
 
   var btn = document.getElementById('ocrBtn');
   var input = document.getElementById('codeInput');
   var oldText = btn.textContent;
   btn.disabled = true;
 
+  // 模式：local 直接用浏览器本地；auto/ai 先走后端 AI
+  var mode = window._ocrMode || 'auto';
   try {
-    btn.textContent = '组件加载中...';
-    await loadOcrScript();
-
-    btn.textContent = '识别中...';
-    var worker = await Tesseract.createWorker('eng', 1, {
-      logger: function(m) {
-        if (m.status === 'recognizing text' && m.progress) {
-          btn.textContent = '识别中 ' + Math.round(m.progress * 100) + '%';
-        }
-      }
-    });
-    await worker.setParameters({ tessedit_char_whitelist: '0123456789' });
-
-    var result = await worker.recognize(file);
-    await worker.terminate();
-
-    // 从识别文本中提取 8-9 位数字串
-    var text = (result.data.text || '').replace(/\\s+/g, '');
-    var match = text.match(/\\d{8,9}/);
-
-    if (match) {
-      input.value = match[0];
-      showToast('识别成功，请确认后提交', 'success');
-      input.focus();
+    if (mode === 'local') {
+      return await localOcr(file, btn, input);
+    }
+    btn.textContent = 'AI 识别中...';
+    var formData = new FormData();
+    formData.append('image', file);
+    var res = await fetch('/api/ocr', { method: 'POST', body: formData });
+    var data = await res.json();
+    if (data.success && data.code) {
+      fillOcrResult(input, data.code);
+    } else if (data.fallback === 'local') {
+      // 后端说 AI 额度用完，前端切本地识别
+      return await localOcr(file, btn, input);
     } else {
-      showToast('未识别到 8-9 位数字互助码，请换清晰截图重试', 'error');
+      showToast(data.error || '未识别到互助码，请手动输入', 'error');
     }
   } catch(e) {
-    showToast('识别失败：' + (e && e.message ? e.message : '未知错误'), 'error');
+    showToast('识别出错，请手动输入互助码', 'error');
   } finally {
     btn.disabled = false;
     btn.textContent = oldText;
   }
+}
+
+/** 把识别结果填入输入框并提示 */
+function fillOcrResult(input, code) {
+  input.value = code;
+  if (code.length >= 8 && code.length <= 9) {
+    showToast('识别成功：' + code + '，请确认后提交', 'success');
+  } else {
+    showToast('识别到 ' + code + '（长度' + code.length + '位），请核对后提交', 'warning');
+  }
+  input.focus();
+}
+
+/** 浏览器本地 OCR（tesseract.js + 红底白字预处理，纯前端不消耗 AI 额度） */
+var _ocrWorker = null;
+async function localOcr(file, btn, input) {
+  if (!window.Tesseract) {
+    showToast('本地识别组件未加载，请手动输入互助码', 'error');
+    return;
+  }
+  btn.textContent = '本地识别中...';
+  try {
+    var canvas = await preprocessImageForOcr(file);
+    if (!_ocrWorker) {
+      btn.textContent = '加载识别模型...';
+      _ocrWorker = await Tesseract.createWorker('eng');
+      await _ocrWorker.setParameters({ tessedit_char_whitelist: '0123456789' });
+    }
+    btn.textContent = '本地识别中...';
+    var result = await _ocrWorker.recognize(canvas);
+    var code = extractCodeFromText(result.data.text || '');
+    if (code) {
+      fillOcrResult(input, code);
+    } else {
+      // 本地未识别到：友好提示手动输入（本地模式不弹额度提示）
+      showToast('本地未识别到互助码，请手动输入', 'error');
+    }
+  } catch(e) {
+    showToast('本地识别出错，请手动输入互助码', 'error');
+  }
+}
+
+/** 红底白字 → 黑字白底预处理（拼多多分享图），提升数字识别率 */
+function preprocessImageForOcr(file) {
+  return new Promise(function(resolve, reject) {
+    var img = new Image();
+    img.onload = function() {
+      try {
+        var scale = 2;
+        var w = img.naturalWidth * scale, h = img.naturalHeight * scale;
+        if (w > 3000) { var r = 3000 / w; w = Math.round(3000); h = Math.round(h * r); }
+        var canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        var ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, w, h);
+        var imgData = ctx.getImageData(0, 0, w, h);
+        var d = imgData.data;
+        for (var i = 0; i < d.length; i += 4) {
+          var r = d[i], g = d[i + 1], b = d[i + 2];
+          var isRed = r > 150 && (r - g) > 40 && (r - b) > 40;
+          var isWhite = r > 200 && g > 200 && b > 200;
+          var v;
+          if (isRed) v = 255;
+          else if (isWhite) v = 0;
+          else {
+            var lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            v = lum > 180 ? 0 : 255;
+          }
+          d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+        }
+        ctx.putImageData(imgData, 0, 0);
+        resolve(canvas);
+      } catch (err) { reject(err); }
+    };
+    img.onerror = function() { reject(new Error('图片加载失败')); };
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+/** 从文本中提取连续 8/9 位数字（兜底取最长 6-12 位） */
+function extractCodeFromText(text) {
+  var nums = (text.match(/\d+/g) || []);
+  var valid = nums.filter(function(n) { return n.length === 8 || n.length === 9; });
+  if (valid.length) return valid[0];
+  if (nums.length) {
+    var longest = nums.reduce(function(a, b) { return b.length > a.length ? b : a; });
+    if (longest.length >= 6 && longest.length <= 12) return longest;
+  }
+  return null;
 }
 
 /** 记录自己用过的码 id */
@@ -1728,6 +1969,9 @@ async function loadConfig() {
     if (cfg.smart_enabled === false) {
       document.getElementById('smartBtn').style.display = 'none';
     }
+
+    // OCR 模式：存全局，识图时决定用 AI 还是浏览器本地
+    window._ocrMode = (cfg.ocr_mode === 'ai' || cfg.ocr_mode === 'local') ? cfg.ocr_mode : 'auto';
   } catch(e) {
     // 配置加载失败静默处理，不影响主功能
   }
@@ -1910,6 +2154,15 @@ tr:hover{background:#fafafa}
         <input type="number" id="dailyLimitInput" min="1" max="2000" placeholder="30" style="width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:8px;font-size:14px">
         <div class="hint">限制同一 IP 每天最多提交次数，范围 1-2000，默认 30。</div>
       </div>
+      <div class="form-group">
+        <label>识图提取模式</label>
+        <select id="ocrModeInput" style="width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:8px;font-size:14px">
+          <option value="auto">自动（AI优先，额度用完自动切浏览器本地）</option>
+          <option value="ai">仅服务端 AI（额度用完提示手动输入）</option>
+          <option value="local">仅浏览器本地（不消耗 AI 额度）</option>
+        </select>
+        <div class="hint">自动模式：默认用 AI 识别，遇到额度限制自动改用浏览器本地识别。本地模式不消耗每日约 347 次的 AI 额度，但首次需下载识别组件（约 10MB）。</div>
+      </div>
     </div>
     <div style="margin-bottom:20px">
       <button class="save-btn" onclick="saveSettings()">保存设置</button>
@@ -2072,6 +2325,7 @@ function loadSettings() {
     document.getElementById('refreshIntervalInput').value = data.data.refresh_interval || '5';
     document.getElementById('rateLimitMaxInput').value = data.data.rate_limit_max || '5';
     document.getElementById('dailyLimitInput').value = data.data.daily_limit || '30';
+    document.getElementById('ocrModeInput').value = (data.data.ocr_mode === 'ai' || data.data.ocr_mode === 'local') ? data.data.ocr_mode : 'auto';
     var ads = data.data.ads || [];
     var container = document.getElementById('adsContainer');
     container.innerHTML = '';
@@ -2103,6 +2357,7 @@ function saveSettings() {
   var refreshInterval = document.getElementById('refreshIntervalInput').value;
   var rateLimitMax = document.getElementById('rateLimitMaxInput').value;
   var dailyLimit = document.getElementById('dailyLimitInput').value;
+  var ocrMode = document.getElementById('ocrModeInput').value;
   var ads = [];
   document.querySelectorAll('#adsContainer .ad-row').forEach(function(row) {
     var img = row.querySelector('.ad-img').value.trim();
@@ -2113,7 +2368,7 @@ function saveSettings() {
   api('/api/admin/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ notice: notice, ads: ads, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartEnabled, refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit })
+    body: JSON.stringify({ notice: notice, ads: ads, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartEnabled, refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit, ocr_mode: ocrMode })
   }).then(function(data) {
     if (data.success) {
       alert('设置已保存');

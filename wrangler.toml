@@ -13,6 +13,10 @@ binding = "DB"
 database_name = "pdd-fudai-db"
 database_id = "YOUR_DATABASE_ID"
 
+# Workers AI 绑定（用于 OCR 识图提取）
+[ai]
+binding = "AI"
+
 # 环境变量 - 通过 `wrangler secret put` 设置
 # ADMIN_KEY: 管理后台访问密钥
 # [vars]
