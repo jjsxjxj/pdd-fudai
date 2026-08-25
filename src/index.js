@@ -1190,7 +1190,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PDD福袋五折互助</title>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://registry.npmmirror.com/tesseract.js/5.1.1/files/dist/tesseract.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f8ff;color:#333;min-height:100vh;padding:20px}
@@ -1596,11 +1596,16 @@ async function runLocalOcr(file, btn) {
     return null;
   }
   if (!_ocrWorker) {
-    btn.textContent = '加载识别模型...';
+    btn.textContent = '加载识别模型(首次约15秒)...';
     try {
       // 强制使用 best 训练数据，与本地 Node 实验保持一致
       _ocrWorker = await Tesseract.createWorker('eng', 1, {
-        langPath: 'https://tessdata.projectnaptha.com/4.0.0_best'
+        // 国内可达源：best_int 整数版（2.95MB，质量接近 best 全量 12.8MB），npmmirror 走阿里云
+        // workerBlobURL:false — npmmirror 无 CORS 头，须直接 new Worker 跨域加载（classic Worker 不要求 CORS）
+        langPath: 'https://unpkg.com/@tesseract.js-data/eng@1.0.0/4.0.0_best_int',
+        workerPath: 'https://registry.npmmirror.com/tesseract.js/5.1.1/files/dist/worker.min.js',
+        corePath: 'https://registry.npmmirror.com/tesseract.js-core/5.1.0/files',
+        workerBlobURL: false
       });
       await _ocrWorker.setParameters({ tessedit_char_whitelist: '0123456789' });
     } catch(e) {
@@ -1987,8 +1992,15 @@ async function loadConfig() {
     // 滚动公告（只在配置了公告时显示）
     var noticeBar = document.getElementById('noticeBar');
     if (cfg.notice) {
-      document.getElementById('noticeText').textContent = cfg.notice;
+      var nt = document.getElementById('noticeText');
+      nt.textContent = cfg.notice;
       noticeBar.style.display = 'flex';
+      // 动态计算滚动时长：速度恒定（约 90px/秒），文字越长滚动越慢，避免长公告飞快
+      try {
+        var w = nt.offsetWidth || nt.scrollWidth || 0;
+        var dur = Math.max(15, w / 90);
+        nt.style.animationDuration = dur.toFixed(1) + 's';
+      } catch (e) {}
     } else {
       noticeBar.style.display = 'none';
     }
