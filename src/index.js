@@ -1162,6 +1162,11 @@ export default {
       }
     }
 
+    // 静态资源（OCR 模型等，由 Worker Assets 直接托管）
+    if (path.startsWith('/ocr/')) {
+      return env.ASSETS.fetch(request);
+    }
+
     // 静态页面
     if (path === '/' || path === '/index.html') {
       return servePage('index');
@@ -1190,7 +1195,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PDD福袋五折互助</title>
-<script src="https://registry.npmmirror.com/tesseract.js/5.1.1/files/dist/tesseract.min.js"></script>
+<script src="/ocr/tesseract.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f8ff;color:#333;min-height:100vh;padding:20px}
@@ -1598,13 +1603,12 @@ async function runLocalOcr(file, btn) {
   if (!_ocrWorker) {
     btn.textContent = '加载识别模型(首次约15秒)...';
     try {
-      // 强制使用 best 训练数据，与本地 Node 实验保持一致
+      // 全部同域自托管（/ocr/，Worker Assets 静态资源），无 CORS 依赖、无第三方 CDN 速度问题
+      // 训练数据为 best_int 整数版（2.95MB，质量接近 best 全量 12.8MB）
       _ocrWorker = await Tesseract.createWorker('eng', 1, {
-        // 国内可达源：best_int 整数版（2.95MB，质量接近 best 全量 12.8MB），npmmirror 走阿里云
-        // workerBlobURL:false — npmmirror 无 CORS 头，须直接 new Worker 跨域加载（classic Worker 不要求 CORS）
-        langPath: 'https://unpkg.com/@tesseract.js-data/eng@1.0.0/4.0.0_best_int',
-        workerPath: 'https://registry.npmmirror.com/tesseract.js/5.1.1/files/dist/worker.min.js',
-        corePath: 'https://registry.npmmirror.com/tesseract.js-core/5.1.0/files',
+        langPath: '/ocr',
+        workerPath: '/ocr/worker.min.js',
+        corePath: '/ocr',
         workerBlobURL: false
       });
       await _ocrWorker.setParameters({ tessedit_char_whitelist: '0123456789' });
