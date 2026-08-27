@@ -2,16 +2,16 @@ name = "pdd-fudai"
 main = "src/index.js"
 compatibility_date = "2024-09-23"
 
+# 自定义域名路由
+routes = [
+  { pattern = "fudai.10087.eu.org/*", zone_id = "YOUR_ZONE_ID" }
+]
+
 # 静态资源（OCR 模型与 tesseract.js 运行时，同域自托管）
 [assets]
 directory = "./public"
 binding = "ASSETS"
 not_found_handling = "none"
-
-# 自定义域名路由
-routes = [
-  { pattern = "fudai.10087.eu.org/*", zone_id = "YOUR_ZONE_ID" }
-]
 
 # D1 数据库绑定
 [[d1_databases]]

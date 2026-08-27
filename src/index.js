@@ -258,7 +258,7 @@ async function handleGetCodes(db) {
 }
 
 /** POST /api/submit — 提交邀请码 */
-async function handleSubmit(db, request, ip) {
+async function handleSubmit(db, request, ip, ctx) {
   let body;
   try {
     body = await request.json();
@@ -308,8 +308,9 @@ async function handleSubmit(db, request, ip) {
     return json({ success: false, error: '今日提交次数已达上限' }, 429);
   }
 
-  // 自动获取归属地（中文，百度API + ip-api.com 双保险，不赶时间）
-  const location = await getIPLocation(request, ip);
+  // 归属地：先用 request.cf 同步取（Cloudflare 自带，零耗时），让提交秒回；
+  // 中文高精度归属地由 waitUntil 后台异步补全（原来同步等百度API，慢时卡提交最多10秒）
+  const location = getIPLocationSync(request);
 
   // 检查重复提交：如果该码已存在（活跃或30秒窗口内使用中），重新排队点亮
   const existing = await db
@@ -324,6 +325,7 @@ async function handleSubmit(db, request, ip) {
       .bind(now(), location, existing.id)
       .run();
     await logAction(db, ip, code, 'submit', 'reactivate');
+    fillLocationAsync(db, ctx, ip, code);
     return json({ success: true, message: '已重新排队' });
   }
 
@@ -334,7 +336,32 @@ async function handleSubmit(db, request, ip) {
     .run();
 
   await logAction(db, ip, code, 'submit', 'ok');
+  fillLocationAsync(db, ctx, ip, code);
   return json({ success: true, message: '提交成功' });
+}
+
+/** 后台异步补全中文归属地：不阻塞提交响应；带 Worker 实例级缓存（10分钟），避免重复查外部API */
+const _ipLocCache = new Map();
+function fillLocationAsync(db, ctx, ip, code) {
+  if (!ctx || !ctx.waitUntil) return;
+  ctx.waitUntil((async () => {
+    try {
+      const cached = _ipLocCache.get(ip);
+      let loc = '';
+      if (cached && Date.now() - cached.t < 600000) {
+        loc = cached.loc;
+      } else {
+        loc = await fetchIPLocation(ip);
+        _ipLocCache.set(ip, { loc, t: Date.now() });
+      }
+      if (loc) {
+        await db
+          .prepare('UPDATE codes SET location = ? WHERE code = ? AND ip = ?')
+          .bind(loc, code, ip)
+          .run();
+      }
+    } catch {}
+  })());
 }
 
 /** POST /api/use/:id — 标记邀请码为已使用，返回完整码供直接跳转 PDD */
@@ -579,15 +606,6 @@ function getIPLocationSync(request) {
   } catch {
     return '';
   }
-}
-
-async function getIPLocation(request, ip) {
-  // 先尝试百度 API（中文，但可能超时）
-  const loc = await fetchIPLocation(ip);
-  if (loc) return loc;
-
-  // 兜底：使用 Cloudflare request.cf（英文）
-  return getIPLocationSync(request);
 }
 
 // ============================================================
@@ -999,7 +1017,7 @@ async function handleOcr(request, env) {
 //  路由分发
 // ============================================================
 
-async function handleAPI(request, env, path) {
+async function handleAPI(request, env, path, ctx) {
   const method = request.method;
   const ip = getClientIP(request);
 
@@ -1022,7 +1040,7 @@ async function handleAPI(request, env, path) {
   }
 
   if (path === '/api/submit' && method === 'POST') {
-    return handleSubmit(env.DB, request, ip);
+    return handleSubmit(env.DB, request, ip, ctx);
   }
 
   // 识图提取（Cloudflare Workers AI 视觉模型）
@@ -1148,14 +1166,14 @@ async function dailyCleanup(db) {
 //  主入口
 // ============================================================
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
     // API 路由
     if (path.startsWith('/api/')) {
       try {
-        return await handleAPI(request, env, path);
+        return await handleAPI(request, env, path, ctx);
       } catch (err) {
         console.error(err);
         return json({ success: false, error: '服务器内部错误' }, 500);
