@@ -37,7 +37,8 @@
 - IP 脱敏兼容 IPv4 / IPv6 / IPv4-mapped IPv6
 
 ### IP 归属地（中文）
-- 三级获取：百度开放数据 API → ip-api.com → Cloudflare request.cf 兜底
+- 提交时同步取 Cloudflare `request.cf` 兜底（零耗时，英文）
+- 中文归属地由百度开放数据 API 在后台异步补全（`waitUntil`，不阻塞提交）
 - ISP 英文翻译为中文（China Mobile → 移动、China Telecom → 电信 等）
 - 提交码时自动获取并存储
 - 管理后台手动拉黑时自动填充
@@ -46,6 +47,18 @@
 - 首页"建议·反馈·申诉"弹窗：QQ 群一键加群 + 站长 QQ（后台可配置，留空自动隐藏）
 - 广告位：静态广告条 + 可关闭的弹窗广告，显示在提交框上方
 - 无广告时全部自动隐藏
+
+### 识图提取（OCR 自动识别互助码）
+- 首页上传/截图福袋分享图，一键识别 8-9 位互助码，免去手动输入
+- **本地识别优先**：tesseract.js 在浏览器端运行，图片不上传（首次加载约 15 秒，之后缓存秒开）
+- OCR 运行时与训练数据**同域自托管**（`public/ocr/`，随 Worker Assets 部署到 `/ocr/`），不依赖任何第三方 CDN，国内加载无障碍
+- 本地识别失败时可切换 **AI 识图兜底**（Cloudflare Workers AI `llama-3.2-11b-vision`），后台可配置 `ocr_mode`：`local`（本地优先）/ `ai`（仅 AI）
+- AI 识图接口带限流与降级提示
+
+### 提交秒回（异步归属地补全）
+- 提交互力码**即时返回**，不再等待归属地查询
+- 同步先用 Cloudflare `request.cf` 数据兜底展示（英文归属地，零耗时）
+- 中文归属地（百度 API）通过 `ctx.waitUntil` 在后台异步补全，几秒内自动更新
 
 ### 防恶意提交（5 层防护）
 1. **IP 黑名单检查** - 命中黑名单直接拒绝
@@ -69,16 +82,21 @@
 ## 技术架构
 
 ```
-用户浏览器 → Cloudflare Workers (API + 内联页面) → Cloudflare D1 (SQLite)
-                    ↓
-          Cron Trigger 23:59 CST → 清空互助码
+用户浏览器 ──┬── 页面 + 公开 API ──→ Cloudflare Workers ──→ D1 (SQLite)
+             │                          ├─ Workers AI（OCR 兜底，可选）
+             │                          ├─ ctx.waitUntil（归属地后台补全）
+             │                          └─ ASSETS 静态资源（/ocr/，tesseract.js 同域自托管）
+             └── OCR 本地识别（tesseract.js WASM，图片不出浏览器）
+                                            ↓
+                              Cron Trigger 23:59 CST → 清空互助码
 ```
 
 - **运行时**: Cloudflare Workers
 - **数据库**: Cloudflare D1 (SQLite)
+- **静态资源**: Worker Assets（`public/` 目录 → 同域 `/ocr/`，无跨域问题）
 - **定时任务**: Cron Trigger `59 15 * * *`（23:59 CST）
 - **前端**: 内联 HTML/CSS/JS（无需额外静态托管）
-- **零外部依赖**: 单文件部署
+- **OCR**: tesseract.js 浏览器端本地识别 + Workers AI 兜底
 
 ## 部署步骤
 
@@ -94,35 +112,47 @@ npm install -g wrangler
 wrangler login
 ```
 
-### 3. 创建 D1 数据库
+### 3. 复制配置模板
+
+```bash
+cp wrangler.toml.example wrangler.toml
+```
+
+仓库中的 `wrangler.toml.example` 是脱敏模板；真实的 `wrangler.toml`（含你的 ID）已加入 `.gitignore`，不会被提交。
+
+### 4. 创建 D1 数据库
 
 ```bash
 wrangler d1 create pdd-fudai-db
 ```
 
-将输出的 `database_id` 复制到 `wrangler.toml`。
+将输出的 `database_id` 填入 `wrangler.toml`。
 
-### 4. 初始化数据库
+### 5. 初始化数据库
 
 ```bash
 wrangler d1 execute pdd-fudai-db --remote --file=schema.sql
 ```
 
-### 5. 设置管理密钥
+### 6. 设置管理密钥
 
 ```bash
 wrangler secret put ADMIN_KEY
 ```
 
-### 6. 部署
+> ADMIN_KEY 是管理后台的登录密码，务必设置复杂一些，且**不要**写进任何文件。
+
+### 7. 部署
 
 ```bash
 wrangler deploy
 ```
 
-### 7. 绑定自定义域名（可选）
+`public/ocr/` 下的 OCR 运行时（约 20MB）会随 Worker Assets 一并部署到同域 `/ocr/`。
 
-在 `wrangler.toml` 中配置 `routes`，并在 Cloudflare Dashboard 添加 DNS 记录。
+### 8. 绑定自定义域名（可选）
+
+在 `wrangler.toml` 中配置 `routes`（替换 pattern 与 zone_id），并在 Cloudflare Dashboard 添加 DNS 记录。详见 [DEPLOY.md](DEPLOY.md)。
 
 ## 配置说明
 
@@ -139,12 +169,14 @@ wrangler deploy
 | `CODE_TTL_HOURS` | 24 | 邀请码过期时间（小时） |
 | `USED_KEEP_MS` | 30000 | 使用后保留时长（毫秒） |
 
-### Wrangler 配置（`wrangler.toml`）
+### Wrangler 配置（`wrangler.toml`，从 `wrangler.toml.example` 复制）
 
 | 字段 | 说明 |
 |------|------|
-| `routes` | 自定义域名绑定 |
+| `routes` | 自定义域名绑定（pattern + zone_id） |
+| `[assets]` | 静态资源绑定（`public/` → 同域 `/ocr/`，OCR 运行时自托管） |
 | `d1_databases` | D1 数据库绑定（binding = "DB"） |
+| `[ai]` | Workers AI 绑定（binding = "AI"，OCR 兜底） |
 | `triggers.crons` | Cron 定时任务（`59 15 * * *` = 23:59 CST 清空码） |
 
 ## API 接口
@@ -156,7 +188,8 @@ wrangler deploy
 | GET | `/api/codes` | 获取邀请码列表 |
 | GET | `/api/config` | 获取首页配置 + 今日统计 |
 | POST | `/api/visit` | 记录访问 |
-| POST | `/api/submit` | 提交邀请码 |
+| POST | `/api/submit` | 提交邀请码（即时返回，归属地后台补全） |
+| POST | `/api/ocr` | AI 识图提取互助码（限流，本地识别失败时兜底） |
 | POST | `/api/use/:id` | 标记已使用，返回完整码 |
 | POST | `/api/quick-use` | 智能直达 |
 | GET | `/api/blacklist` | 公共黑名单公示 |
@@ -182,13 +215,13 @@ wrangler deploy
 pdd-fudai/
 ├── src/
 │   └── index.js              # Worker 主文件（API + 内联前端 + 内联管理后台）
-├── scripts/
-│   ├── check-inline-js.js    # 内联 JS 语法诊断工具
-│   ├── stress_test.py        # 压测脚本（50并发，5分钟）
-│   └── stress-test-report.txt # 压测报告
+├── public/
+│   └── ocr/                  # OCR 运行时（tesseract.js 主库/worker/core WASM/英文训练数据，约 20MB）
+├── scripts/                  # 本地开发工具（不入 git，不上传）
 ├── schema.sql                # D1 数据库建表脚本
-├── wrangler.toml             # Cloudflare Workers 配置
+├── wrangler.toml.example     # 部署配置模板（脱敏，复制为 wrangler.toml 使用）
 ├── package.json              # 项目配置
+├── DEPLOY.md                 # 详细部署教程（新手友好）
 └── README.md                 # 本文档
 ```
 

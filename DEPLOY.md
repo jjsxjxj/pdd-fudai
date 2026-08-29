@@ -124,7 +124,7 @@ wrangler d1 create pdd-fudai-db
 ┌───────────────────────────────────────┬───────────────────────────────┐
 │ database_id                           │ database_name                 │
 ├───────────────────────────────────────┼───────────────────────────────┤
-│ YOUR_DATABASE_ID  │ pdd-fudai-db                  │
+│ abcdef12-3456-7890-abcd-ef1234567890  │ pdd-fudai-db                  │
 └───────────────────────────────────────┴───────────────────────────────┘
 ```
 
@@ -189,10 +189,16 @@ Enter a secret value:
 
 ### 8.1 修改配置文件
 
-打开项目目录下的 `wrangler.toml` 文件，找到这一行：
+先把配置模板复制一份：
+
+```bash
+cp wrangler.toml.example wrangler.toml
+```
+
+打开 `wrangler.toml`，找到这一行：
 
 ```toml
-database_id = "YOUR_DATABASE_ID"
+database_id = "abcdef12-3456-7890-abcd-ef1234567890"
 ```
 
 把引号里的值替换成 **第 5 步你记下来的 database_id**。
@@ -261,7 +267,7 @@ Uploaded pdd-fudai (1.23 sec)
 
 ```toml
 routes = [
-  { pattern = "fudai.10087.eu.org/*", zone_id = "YOUR_ZONE_ID" }
+  { pattern = "fudai.yourdomain.com/*", zone_id = "YOUR_ZONE_ID" }
 ]
 ```
 

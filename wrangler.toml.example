@@ -1,0 +1,37 @@
+# wrangler 配置模板
+# 使用方法：复制本文件为 wrangler.toml，并替换其中的占位符为你的真实值
+#   cp wrangler.toml.example wrangler.toml
+
+name = "pdd-fudai"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# 自定义域名路由（可选；不绑定域名可删除此段，直接用 workers.dev）
+# 把 pattern 改成你的域名，zone_id 改成你域名在 Cloudflare 的 Zone ID
+routes = [
+  { pattern = "fudai.yourdomain.com/*", zone_id = "YOUR_ZONE_ID" }
+]
+
+# 静态资源（OCR 模型与 tesseract.js 运行时，同域自托管，见 public/ocr/）
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "none"
+
+# D1 数据库绑定
+# 部署前先执行: wrangler d1 create pdd-fudai-db，把输出的 database_id 填到下面
+[[d1_databases]]
+binding = "DB"
+database_name = "pdd-fudai-db"
+database_id = "YOUR_DATABASE_ID"
+
+# Workers AI 绑定（用于 AI 识图提取兜底）
+[ai]
+binding = "AI"
+
+# 环境变量 - 通过 `wrangler secret put` 设置（不要写在此文件里！）
+# ADMIN_KEY: 管理后台访问密钥
+
+# Cron Trigger: 每天 23:59 CST (15:59 UTC) 自动清空互助码
+[triggers]
+crons = ["59 15 * * *"]

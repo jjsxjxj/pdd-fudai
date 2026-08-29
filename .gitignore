@@ -14,3 +14,6 @@ SKILL-GUIDE.md
 .DS_Store
 Thumbs.db
 node_modules/
+
+# 真实部署配置含私有 ID，只提交 wrangler.toml.example 模板
+wrangler.toml
