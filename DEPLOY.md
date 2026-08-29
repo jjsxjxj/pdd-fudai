@@ -271,7 +271,7 @@ routes = [
 ]
 ```
 
-- 把 `fudai.10087.eu.org` 改成你的域名（如 `fudai.yourdomain.com`）
+- 把 `fudai.yourdomain.com` 改成你自己的域名
 - 把 `zone_id` 改成你的域名的 Zone ID
 
 > **怎么找 Zone ID？**
