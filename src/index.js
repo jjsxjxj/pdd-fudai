@@ -1825,7 +1825,74 @@ async function loadCodes(fromAutoRefresh) {
   }
 }
 
+/** 首次跳转前的提醒弹窗：必须先从拼多多首页进福袋界面，否则组队失败。
+ *  同一用户（浏览器）只提示一次，"跳转"和"智能直达"共用同一标记。
+ *  返回 Promise<boolean>：true=继续跳转，false=用户取消 */
+function ensureJumpTip() {
+  return new Promise(function(resolve) {
+    var KEY = 'pdd_jump_tip_ok';
+    try { if (localStorage.getItem(KEY) === '1') return resolve(true); } catch(e) { return resolve(true); }
+
+    var overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:9999;padding:16px;';
+    var box = document.createElement('div');
+    box.style.cssText = 'background:#fff;border-radius:12px;padding:22px 20px;max-width:340px;width:100%;box-shadow:0 8px 30px rgba(0,0,0,.2);';
+    var title = document.createElement('div');
+    title.style.cssText = 'font-size:16px;font-weight:600;margin-bottom:10px;text-align:center;color:#E02E24;';
+    title.textContent = '⚠️ 重要：请先进入福袋界面';
+    var sub = document.createElement('div');
+    sub.style.cssText = 'font-size:13.5px;color:#444;line-height:1.75;margin-bottom:8px;';
+    sub.innerHTML = '助力前请先<b>手动从拼多多首页进入福袋活动界面</b>：<br>' +
+      '<span style="color:#E02E24">拼多多首页 → 百亿补贴 → 百亿消费券 → 福袋</span><br>' +
+      '否则直接跳转搜索，<b>组队会失败</b>。';
+    var tipFoot = document.createElement('div');
+    tipFoot.style.cssText = 'font-size:12px;color:#999;margin-bottom:16px;text-align:center;';
+    tipFoot.textContent = '此提示仅显示一次，确定后将正常跳转';
+    var okBtn = document.createElement('button');
+    okBtn.textContent = '我已进入福袋界面，继续跳转';
+    okBtn.style.cssText = 'display:block;width:100%;padding:11px;margin-bottom:10px;border:none;border-radius:8px;background:#E02E24;color:#fff;font-size:14px;font-weight:600;cursor:pointer;';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.textContent = '先去拼多多，稍后再来';
+    cancelBtn.style.cssText = 'display:block;width:100%;padding:11px;border:1px solid #ddd;border-radius:8px;background:#fff;color:#666;font-size:14px;cursor:pointer;';
+
+    function done(ok) {
+      if (overlay.parentNode) document.body.removeChild(overlay);
+      if (ok) { try { localStorage.setItem(KEY, '1'); } catch(e) {} }
+      resolve(ok);
+    }
+    okBtn.onclick = function() { done(true); };
+    cancelBtn.onclick = function() { done(false); };
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) done(false); });
+
+    box.appendChild(title); box.appendChild(sub); box.appendChild(tipFoot);
+    box.appendChild(okBtn); box.appendChild(cancelBtn);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+  });
+}
+
+/** 延迟打开拼多多：先弹一个带倒计时的提示，让用户看清"要先在福袋界面"再跳。
+ *  延迟 1.6s —— 在浏览器 user activation 有效期（约 5s）内，window.open 不会被拦截。 */
+function openPddDelayed(code, prefix) {
+  var url = 'https://mobile.yangkeduo.com/search_result.html?search_key=' + code;
+  var t = document.getElementById('toast');
+  var left = 2;
+  function paint() {
+    t.textContent = (prefix ? prefix + '，' : '') + left + ' 秒后跳转拼多多，请确认已在福袋界面';
+    t.className = 'toast show success';
+  }
+  paint();
+  var timer = setInterval(function() {
+    left--;
+    if (left > 0) { paint(); return; }
+    clearInterval(timer);
+    t.className = 'toast';
+    window.open(url, '_blank');
+  }, 800);
+}
+
 async function useCode(id, btn) {
+  if (!(await ensureJumpTip())) return;
   try {
     var res = await fetch('/api/use/' + id, { method: 'POST' });
     var data = await res.json();
@@ -1834,8 +1901,8 @@ async function useCode(id, btn) {
       addMyUsed(id);
       var item = btn.closest('.list-item');
       btn.outerHTML = '<span class="used-tag">已使用</span>';
-      // 直接打开拼多多搜索（用返回的完整码）
-      window.open('https://mobile.yangkeduo.com/search_result.html?search_key=' + data.code, '_blank');
+      // 延迟 1.6 秒再打开拼多多，先让用户看清提示
+      openPddDelayed(data.code, '');
       // 立即刷新，让 30 秒倒计时接管
       setTimeout(loadCodes, 800);
     } else {
@@ -1851,14 +1918,14 @@ async function useCode(id, btn) {
 async function quickUse() {
   var btn = document.getElementById('smartBtn');
   btn.disabled = true;
+  if (!(await ensureJumpTip())) { btn.disabled = false; return; }
   try {
     var res = await fetch('/api/quick-use', { method: 'POST' });
     var data = await res.json();
     if (data.success) {
       addQuickUsedFromResponse(data);
       // 标记为"刚使用"（需要拿到 id —— 智能直达接口返回完整码，前端从列表匹配）
-      showToast('智能直达成功，已自动打开拼多多', 'success');
-      window.open('https://mobile.yangkeduo.com/search_result.html?search_key=' + data.code, '_blank');
+      openPddDelayed(data.code, '智能直达成功');
       setTimeout(loadCodes, 600);
     } else {
       showToast(data.error || '暂无可用互助码', 'error');
