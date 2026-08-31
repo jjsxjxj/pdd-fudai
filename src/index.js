@@ -19,41 +19,90 @@ const CONFIG = {
   DAILY_LIMIT: 30,             // 每IP每日最大提交次数
   CODE_TTL_HOURS: 24,          // 邀请码过期时间（小时）
   USED_KEEP_MS: 30_000,        // 使用后保留时长（毫秒），30秒后自动删除轮换
-  MAX_CODE_LENGTH: 20,         // 防止超长输入
+  OCR_AI_RATE_LIMIT: 10,       // 每IP每分钟 AI 识图次数上限（防额度盗刷）
+  USE_RATE_LIMIT: 20,          // 每IP每分钟标记使用/智能直达次数上限（防遍历清空列表）
+  OCR_MAX_IMG_BYTES: 4 * 1024 * 1024, // 服务端识图图片大小上限（4MB）
+  VISIT_RATE_LIMIT: 30,        // 每IP每分钟访问打点上限（防 visits 表被刷爆）
+  ADMIN_FAIL_LIMIT: 10,        // 每IP每分钟后台鉴权失败次数上限（防密钥暴力破解）
+  REPORT_AUTO_BAN_THRESHOLD: 3,   // 自动拉黑所需的不同举报人IP数
+  REPORT_AUTO_BAN_WINDOW_MS: 24 * 3600_000, // 自动拉黑的举报统计时间窗（24小时）
+  LOG_KEEP_DAYS: 30,           // submit_logs / visits / reports 保留天数
+  PAGE_SIZE_MAX: 200,          // 后台分页每页最大条数
+  PAGE_MAX: 100000,            // 后台分页最大页码（防 offset 溢出成非安全整数）
 };
+
+/** 需要黑名单拦截的公开写接口（被拉黑的 IP 不仅不能提交，也不能领码/举报/刷 AI 额度） */
+const BLACKLIST_GUARDED = [
+  { method: 'POST', test: (p) => p === '/api/submit' },
+  { method: 'POST', test: (p) => p === '/api/quick-use' },
+  { method: 'POST', test: (p) => p === '/api/ocr' },
+  { method: 'POST', test: (p) => /^\/api\/use\/\d+$/.test(p) },
+  { method: 'POST', test: (p) => /^\/api\/report\/\d+$/.test(p) },
+];
 
 // ============================================================
 //  工具函数
 // ============================================================
 
-/** 获取客户端真实 IP（穿透 Cloudflare 代理） */
+/** 获取客户端真实 IP
+ *  只信任 Cloudflare 注入的 cf-connecting-ip（用户无法伪造）。
+ *  切勿 fallback 到 x-forwarded-for / x-real-ip：这两个头客户端可随意伪造，
+ *  非 CF 环境下会被用来绕过黑名单、限流、甚至伪造多个 IP 触发自动拉黑。 */
 function getClientIP(request) {
-  return (
-    request.headers.get('cf-connecting-ip') ||
-    request.headers.get('x-real-ip') ||
-    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-    '0.0.0.0'
-  );
+  return request.headers.get('cf-connecting-ip') || '0.0.0.0';
 }
 
 /** 脱敏：隐藏中间两位 */
 function maskCode(code) {
-  if (code.length < 4) return '****';
-  const mid = Math.floor(code.length / 2);
-  return code.slice(0, mid - 1) + '**' + code.slice(mid + 1);
+  const s = String(code == null ? '' : code);
+  if (s.length < 4) return '****';
+  const mid = Math.floor(s.length / 2);
+  return s.slice(0, mid - 1) + '**' + s.slice(mid + 1);
 }
 
-/** JSON 响应 */
+/** JSON 响应
+ *  首页与 API 同域（fetch 用相对路径），无需 CORS —— 移除 Access-Control-Allow-Origin:*，
+ *  避免任意站点跨域携带 X-Admin-Key 调用管理接口。
+ *  统一 no-store：/api/use、/api/quick-use 的响应体里是完整互助码，
+ *  一旦被中间代理或浏览器缓存，同一 URL 的后续请求可能读到别人的码。 */
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
+    headers: securityHeaders({
       'Content-Type': 'application/json; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Key',
-    },
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+    }),
   });
+}
+
+/** 安全响应头：防 MIME 嗅探、防点击劫持、防 Referer 泄露
+ *  X-XSS-Protection 已被所有现代浏览器移除（且历史上曾引入过漏洞），改用 CSP。
+ *  CSP 用 'unsafe-inline'：本项目前端 HTML/CSS/JS 全部内联在 Worker 里，暂不做 nonce 化；
+ *  即便如此仍能挡住外部脚本注入（script-src 只允许 self 与下面显式列出的 CF 域）。
+ *  static.cloudflareinsights.com：Cloudflare Web Analytics(RUM) 在边缘自动注入的 beacon 脚本，
+ *  不加白会被 CSP 拦掉、控制台报红且统计失效。上报端点是同域 /cdn-cgi/rum，
+ *  但部分版本会直接打 cloudflareinsights.com，故 connect-src 一并放行。 */
+const CF_BEACON_ORIGIN = 'https://static.cloudflareinsights.com';
+const CF_RUM_ORIGIN = 'https://cloudflareinsights.com';
+
+function securityHeaders(extra = {}) {
+  return Object.assign({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': [
+      "default-src 'self'",
+      `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: ${CF_BEACON_ORIGIN}`,
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob: https:",
+      `connect-src 'self' blob: data: ${CF_RUM_ORIGIN}`,
+      "worker-src 'self' blob:",
+      "frame-ancestors 'none'",
+      "base-uri 'none'",
+      "form-action 'none'",
+      "object-src 'none'",
+    ].join('; '),
+  }, extra);
 }
 
 /** 当前时间 ISO 字符串 */
@@ -61,17 +110,18 @@ function now() {
   return new Date().toISOString();
 }
 
-/** 检查是否过期 */
-function isExpired(isoTime, hours) {
-  const diff = Date.now() - new Date(isoTime).getTime();
-  return diff > hours * 3600_000;
+/** 北京时间（CST, UTC+8）今日 0:00 对应的 UTC ISO 字符串。
+ *  Workers 跑 UTC，直接 setHours 会算成 UTC 0:00（=CST 8:00），导致今日统计边界错位。 */
+function getCSTTodayStartISO() {
+  const cstOfNow = new Date(Date.now() + 8 * 3600_000);
+  cstOfNow.setUTCHours(0, 0, 0, 0);
+  return new Date(cstOfNow.getTime() - 8 * 3600_000).toISOString();
 }
 
 // ============================================================
 //  防恶意提交中间件
 // ============================================================
 
-/** 检查 IP 是否在黑名单中 */
 /** 检查IP是否在黑名单中（含过期判断） */
 async function checkBlacklist(db, ip) {
   const result = await db.prepare('SELECT ip, reason, expires_at FROM blacklist WHERE ip = ?').bind(ip).first();
@@ -88,37 +138,56 @@ async function checkBlacklist(db, ip) {
   return result;
 }
 
+/** 统计某 IP 在 sinceISO 之后的某类动作条数
+ *  原来 checkRateLimit / checkActionRateLimit / checkDailyLimit 三处各写了一遍
+ *  完全相同的 COUNT(*) 语句，只有时间窗和 action 不同。 */
+async function countActions(db, ip, action, sinceISO) {
+  const row = await db
+    .prepare('SELECT COUNT(*) as count FROM submit_logs WHERE ip = ? AND created_at > ? AND action = ?')
+    .bind(ip, sinceISO, action)
+    .first();
+  return (row && row.count) || 0;
+}
+
 /** 速率限制：检查窗口内提交次数 */
 async function checkRateLimit(db, ip, maxPerMin) {
   if (!maxPerMin || maxPerMin < 1) maxPerMin = CONFIG.RATE_LIMIT_MAX;
   const since = new Date(Date.now() - CONFIG.RATE_LIMIT_WINDOW_MS).toISOString();
-  const result = await db
-    .prepare('SELECT COUNT(*) as count FROM submit_logs WHERE ip = ? AND created_at > ? AND action = ?')
-    .bind(ip, since, 'submit')
-    .first();
-  return result.count >= maxPerMin;
+  return (await countActions(db, ip, 'submit', since)) >= maxPerMin;
+}
+
+/** 通用动作限流：某 IP 一分钟内某动作（use/ocr_ai/...）次数是否达上限
+ *  用于 use、quick-use、AI 识图等公开接口的防刷（submit 走上面专用限流） */
+async function checkActionRateLimit(db, ip, action, maxPerMin) {
+  if (!ip || ip === '0.0.0.0' || !maxPerMin || maxPerMin < 1) return false;
+  const since = new Date(Date.now() - 60_000).toISOString();
+  return (await countActions(db, ip, action, since)) >= maxPerMin;
 }
 
 /** 每日限额 */
 async function checkDailyLimit(db, ip, dailyMax) {
   if (!dailyMax || dailyMax < 1) dailyMax = CONFIG.DAILY_LIMIT;
-  // 基于北京时间（CST）今日 0:00，避免 Workers UTC 时区导致的边界错位
-  const cstOfNow = new Date(Date.now() + 8 * 3600_000);
-  cstOfNow.setUTCHours(0, 0, 0, 0);
-  const todayStartMs = cstOfNow.getTime() - 8 * 3600_000;
-  const result = await db
-    .prepare('SELECT COUNT(*) as count FROM submit_logs WHERE ip = ? AND created_at > ? AND action = ?')
-    .bind(ip, new Date(todayStartMs).toISOString(), 'submit')
-    .first();
-  return result.count >= dailyMax;
+  return (await countActions(db, ip, 'submit', getCSTTodayStartISO())) >= dailyMax;
 }
 
-/** 记录日志 */
+/** 记录日志
+ *  code / reason 截断：honeypot 分支会把未经校验的 body.code 直接落库，
+ *  攻击者可以塞 1MB 字符串（body 上限 8MB）反复提交撑爆 D1 存储。 */
 async function logAction(db, ip, code, action, reason = '') {
   await db
     .prepare('INSERT INTO submit_logs (ip, code, action, reason, created_at) VALUES (?, ?, ?, ?, ?)')
-    .bind(ip, code || '', action, reason, now())
+    .bind(ip, String(code || '').slice(0, 32), action, String(reason || '').slice(0, 200), now())
     .run();
+}
+
+/** 解析路径里的自增主键 id
+ *  原来各处直接 parseInt(match[1])（无 radix，且不设上限）：
+ *  /api/use/99999999999999999999 会被解析成 1e20 这种浮点数再 bind 进 SQL，
+ *  行为依赖驱动实现。这里统一收敛为安全整数，越界返回 null 由调用方回 404。 */
+function parseId(raw) {
+  const n = parseInt(raw, 10);
+  if (!Number.isSafeInteger(n) || n < 1) return null;
+  return n;
 }
 
 /** 校验邀请码格式（8~9 位数字） */
@@ -144,22 +213,56 @@ async function getSetting(db, key) {
   return row ? row.value : null;
 }
 
-/** 保存站点设置 */
-async function setSetting(db, key, value) {
-  await db
-    .prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
-    .bind(key, value, now())
-    .run();
+/** 批量读取站点设置，返回 { key: value } 映射
+ *  原来 /api/config 与后台设置页各自串行 await 了 7~9 次 getSetting，
+ *  等于 7~9 个 D1 往返（每次约 5~20ms）；这里一条 IN 查询搞定。 */
+async function getSettings(db, keys) {
+  const placeholders = keys.map(() => '?').join(',');
+  const res = await db
+    .prepare(`SELECT key, value FROM settings WHERE key IN (${placeholders})`)
+    .bind(...keys)
+    .all();
+  const map = {};
+  for (const row of res.results || []) map[row.key] = row.value;
+  return map;
 }
 
-/** GET /api/config — 获取首页配置（公告/广告/联系方式/开关），空值自动省略 */
+/** URL 协议白名单：只允许 http/https，防 javascript:/data: 等存储型 XSS
+ *  额外拒绝引号/尖括号/空白：这些字符会被拼进 HTML 属性（后台广告输入框的 value），
+ *  只做协议前缀判断不足以防属性截断注入（如 https://x/" onmouseover="...）。 */
+function sanitizeUrl(u) {
+  if (!u) return '';
+  const t = String(u).trim();
+  if (!/^https?:\/\//i.test(t)) return '';
+  if (/["'<>\\\s]/.test(t)) return '';
+  return t;
+}
+
+/** 安全读取 JSON 请求体
+ *  原来 4 个处理器各自复制一份 try/catch，且都假定解析结果是对象：
+ *  body 为 `null` / `"str"` / `123`（都是合法 JSON）时，后续 body.xxx 会抛 TypeError
+ *  冒泡成 500。这里统一要求必须是普通对象。 */
+async function readJsonBody(request) {
+  try {
+    const body = await request.json();
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+    return body;
+  } catch {
+    return null;
+  }
+}
+
+/** GET /api/config — 获取首页配置（公告/广告/联系方式/开关），空值自动省略
+ *  这是首页每次加载都会打的接口，原来 7 次 getSetting + 3 次统计 = 10 个串行 D1 往返；
+ *  现在压到 1 次 settings 批量读 + 1 次三指标合并统计。 */
 async function handleGetConfig(db) {
-  const notice = await getSetting(db, 'notice');
-  const adsRaw = await getSetting(db, 'ads');
-  const qqGroup = await getSetting(db, 'qq_group');
-  const qqOwner = await getSetting(db, 'qq_owner');
-  const smartRaw = await getSetting(db, 'smart_enabled');
-  const refreshInterval = await getSetting(db, 'refresh_interval');
+  const s = await getSettings(db, ['notice', 'ads', 'ad_title', 'ad_sub', 'qq_group', 'qq_owner', 'smart_enabled', 'refresh_interval', 'ocr_mode']);
+  const notice = s.notice;
+  const adsRaw = s.ads;
+  const qqGroup = s.qq_group;
+  const qqOwner = s.qq_owner;
+  const smartRaw = s.smart_enabled;
+  const refreshInterval = s.refresh_interval;
   const data = {};
 
   // 刷新间隔：默认 5 秒，范围 3-30 秒
@@ -187,6 +290,9 @@ async function handleGetConfig(db) {
       image_url: ad.image_url.trim(),
       link_url: (ad.link_url && ad.link_url.trim()) || '',
     }));
+    // 弹窗广告文案：后台可配，未配则弹窗不显示标题栏（不再硬编码任何品牌名）
+    if (s.ad_title && s.ad_title.trim()) data.ad_title = s.ad_title.trim();
+    if (s.ad_sub && s.ad_sub.trim()) data.ad_sub = s.ad_sub.trim();
   }
 
   // 联系方式：非空才返回（首页据此显示按钮/弹窗）
@@ -197,40 +303,51 @@ async function handleGetConfig(db) {
   data.smart_enabled = smartRaw !== 'off';
 
   // OCR 模式：local（默认，浏览器本地优先）/ ai（仅服务端 AI），默认 local
-  const ocrModeRaw = await getSetting(db, 'ocr_mode');
-  data.ocr_mode = (ocrModeRaw === 'ai') ? 'ai' : 'local';
+  data.ocr_mode = (s.ocr_mode === 'ai') ? 'ai' : 'local';
 
   // 今日统计（按中国时区 CST UTC+8 算今日 0:00，与前端列表展示日期一致）
-  // Cloudflare Workers 的 Date 是 UTC 直接 setHours 会算成 UTC 0:00（=CST 8:00），
-  // 导致 0:00~8:00 (CST) 之间提交的码按日期显示算"今日"但 stats 不算，体验割裂。
-  const nowMs = Date.now();
-  const cstShiftMs = 8 * 3600_000;
-  const cstOfNow = new Date(nowMs + cstShiftMs);
-  cstOfNow.setUTCHours(0, 0, 0, 0);                          // CST 今日 0:00
-  const todayStartMs = cstOfNow.getTime() - cstShiftMs;      // 换回 UTC ms
-  const todayISO = new Date(todayStartMs).toISOString();
-  const todaySubmits = await db.prepare("SELECT COUNT(*) as count FROM submit_logs WHERE created_at > ? AND action = 'submit'").bind(todayISO).first();
-  data.today_submits = todaySubmits ? (todaySubmits.count || 0) : 0;
+  // 三个指标合并成一条查询，比原来 3 次串行往返快得多
+  const todayISO = getCSTTodayStartISO();
+  data.today_submits = 0;
+  data.today_visits = 0;
+  data.today_ips = 0;
   try {
-    const todayVisits = await db.prepare("SELECT COUNT(*) as count FROM visits WHERE created_at > ?").bind(todayISO).first();
-    const todayUniqueIPs = await db.prepare("SELECT COUNT(DISTINCT ip) as count FROM visits WHERE created_at > ?").bind(todayISO).first();
-    data.today_visits = todayVisits ? (todayVisits.count || 0) : 0;
-    data.today_ips = todayUniqueIPs ? (todayUniqueIPs.count || 0) : 0;
+    const [submits, visits] = await db.batch([
+      db.prepare("SELECT COUNT(*) as c FROM submit_logs WHERE created_at > ? AND action = 'submit'").bind(todayISO),
+      db.prepare('SELECT COUNT(*) as c, COUNT(DISTINCT ip) as ips FROM visits WHERE created_at > ?').bind(todayISO),
+    ]);
+    const sRow = submits.results && submits.results[0];
+    const vRow = visits.results && visits.results[0];
+    if (sRow) data.today_submits = sRow.c || 0;
+    if (vRow) {
+      data.today_visits = vRow.c || 0;
+      data.today_ips = vRow.ips || 0;
+    }
   } catch {
-    data.today_visits = 0;
-    data.today_ips = 0;
+    // 统计失败不影响主配置返回
   }
 
   return json({ success: true, data });
 }
 
-/** POST /api/visit — 记录访问 */
+/** POST /api/visit — 记录访问（visits 表在 schema.sql 中创建）
+ *  加限流：这是完全公开的写接口，不限流可被脚本每秒上千次刷爆 D1 写配额与统计数字。
+ *  计数直接查 visits 表（不再额外写一条 submit_logs，省一半写入）。 */
 async function handleVisit(db, ip) {
   try {
-    await db.prepare("CREATE TABLE IF NOT EXISTS visits (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, created_at TEXT NOT NULL)").run();
+    if (ip && ip !== '0.0.0.0') {
+      const since = new Date(Date.now() - 60_000).toISOString();
+      const hit = await db
+        .prepare('SELECT COUNT(*) as count FROM visits WHERE ip = ? AND created_at > ?')
+        .bind(ip, since)
+        .first();
+      if (hit && hit.count >= CONFIG.VISIT_RATE_LIMIT) {
+        return json({ success: true }); // 静默丢弃，不暴露限流细节
+      }
+    }
     await db.prepare("INSERT INTO visits (ip, created_at) VALUES (?, ?)").bind(ip, now()).run();
   } catch (e) {
-    // 忽略建表/插入错误，不阻塞用户
+    // 忽略插入错误，不阻塞用户
   }
   return json({ success: true });
 }
@@ -239,32 +356,41 @@ async function handleVisit(db, ip) {
 //  API 路由处理
 // ============================================================
 
-/** GET /api/codes — 获取邀请码列表（未使用在前，30秒内已使用灰色排后面，超时即删轮换） */
-async function handleGetCodes(db) {
-  // 1) 清理过期码：超过 TTL 的 active 码 和 超过 USED_KEEP_MS 的 used 码
+/** GET /api/codes — 获取邀请码列表（未使用在前，30秒内已使用灰色排后面，超时即删轮换）
+ *  性能要点：原实现每次请求都先跑一条 DELETE。首页每 5 秒轮询一次，
+ *  100 个在线用户就是 20 次写/秒，纯粹为了做垃圾回收，很容易吃满 D1 写配额。
+ *  改为：① SELECT 里直接按截止时间过滤，展示效果与立即删除完全一致；
+ *        ② DELETE 降级为后台清理，只在约 10% 的请求里通过 waitUntil 异步执行。 */
+async function handleGetCodes(db, ctx) {
   const ttlCutoff = new Date(Date.now() - CONFIG.CODE_TTL_HOURS * 3600_000).toISOString();
   const delCutoff = new Date(Date.now() - CONFIG.USED_KEEP_MS).toISOString();
-  await db.prepare(
-    "DELETE FROM codes WHERE (status = 'active' AND created_at < ?) OR (status = 'used' AND used_at IS NOT NULL AND used_at < ?)"
-  ).bind(ttlCutoff, delCutoff).run();
 
-  // 2) 返回：未使用的在前（可跳转），30秒内的已使用排后面（灰色）
   const result = await db
-    .prepare("SELECT id, code_masked, status, used_at, created_at, location FROM codes WHERE status IN ('active','used') ORDER BY (status = 'used'), created_at DESC LIMIT ?")
-    .bind(CONFIG.MAX_ACTIVE_CODES)
+    .prepare(
+      "SELECT id, code_masked, status, used_at, created_at, location FROM codes " +
+      "WHERE (status = 'active' AND created_at >= ?) " +
+      "   OR (status = 'used' AND used_at IS NOT NULL AND used_at >= ?) " +
+      "ORDER BY (status = 'used'), created_at DESC LIMIT ?"
+    )
+    .bind(ttlCutoff, delCutoff, CONFIG.MAX_ACTIVE_CODES)
     .all();
+
+  // 抽样触发后台清理，避免每次轮询都写库
+  if (ctx && ctx.waitUntil && Math.random() < 0.1) {
+    ctx.waitUntil(
+      db.prepare(
+        "DELETE FROM codes WHERE (status = 'active' AND created_at < ?) OR (status = 'used' AND used_at IS NOT NULL AND used_at < ?)"
+      ).bind(ttlCutoff, delCutoff).run().catch(() => {})
+    );
+  }
 
   return json({ success: true, data: result.results });
 }
 
 /** POST /api/submit — 提交邀请码 */
 async function handleSubmit(db, request, ip, ctx) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ success: false, error: '请求格式错误' }, 400);
-  }
+  const body = await readJsonBody(request);
+  if (!body) return json({ success: false, error: '请求格式错误' }, 400);
 
   // 蜜罐检查：如果隐藏字段被填写，说明是机器人
   const honeypot = body.website || body.url_field || '';
@@ -281,17 +407,13 @@ async function handleSubmit(db, request, ip, ctx) {
   }
   const code = validation.code;
 
-  // 检查黑名单
-  const blocked = await checkBlacklist(db, ip);
-  if (blocked) {
-    await logAction(db, ip, code, 'blocked', `blacklist: ${blocked.reason}`);
-    return json({ success: false, error: '您的IP已被拉黑，如需申诉请联系管理员' }, 403);
-  }
+  // 黑名单已在 handleAPI 入口统一拦截（BLACKLIST_GUARDED），此处不再重复查一次
 
-  // 读取后台可配置的提交限流参数（读取失败则用 CONFIG 默认值）
-  let rateLimitMax = parseInt(await getSetting(db, 'rate_limit_max'), 10);
+  // 读取后台可配置的提交限流参数（一次批量读，读取失败则用 CONFIG 默认值）
+  const limitCfg = await getSettings(db, ['rate_limit_max', 'daily_limit']);
+  let rateLimitMax = parseInt(limitCfg.rate_limit_max, 10);
   if (isNaN(rateLimitMax) || rateLimitMax < 1) rateLimitMax = CONFIG.RATE_LIMIT_MAX;
-  let dailyLimit = parseInt(await getSetting(db, 'daily_limit'), 10);
+  let dailyLimit = parseInt(limitCfg.daily_limit, 10);
   if (isNaN(dailyLimit) || dailyLimit < 1) dailyLimit = CONFIG.DAILY_LIMIT;
 
   // 速率限制
@@ -340,19 +462,24 @@ async function handleSubmit(db, request, ip, ctx) {
   return json({ success: true, message: '提交成功' });
 }
 
-/** 后台异步补全中文归属地：不阻塞提交响应；带 Worker 实例级缓存（10分钟），避免重复查外部API */
-const _ipLocCache = new Map();
+/** 后台异步补全中文归属地：不阻塞提交响应；用 Cloudflare Cache API 缓存（跨 isolate、10分钟 TTL），
+ *  避免重复查外部 API（实例级 Map 在 Workers 中几乎无效且无上限） */
 function fillLocationAsync(db, ctx, ip, code) {
   if (!ctx || !ctx.waitUntil) return;
   ctx.waitUntil((async () => {
     try {
-      const cached = _ipLocCache.get(ip);
+      const cacheKey = 'https://iploc-cache.local/' + ip;
       let loc = '';
-      if (cached && Date.now() - cached.t < 600000) {
-        loc = cached.loc;
+      const hit = await caches.default.match(cacheKey);
+      if (hit) {
+        loc = await hit.text();
       } else {
         loc = await fetchIPLocation(ip);
-        _ipLocCache.set(ip, { loc, t: Date.now() });
+        if (loc) {
+          await caches.default.put(cacheKey, new Response(loc, {
+            headers: { 'Cache-Control': 'public, max-age=600' },
+          }));
+        }
       }
       if (loc) {
         await db
@@ -364,55 +491,85 @@ function fillLocationAsync(db, ctx, ip, code) {
   })());
 }
 
-/** POST /api/use/:id — 标记邀请码为已使用，返回完整码供直接跳转 PDD */
+/** POST /api/use/:id — 标记邀请码为已使用，返回完整码供直接跳转 PDD
+ *  原实现「先 SELECT 判 active，再 UPDATE」存在竞态：并发两个请求都能读到 active，
+ *  于是同一个码被返回给两个人（对福袋助力来说第二个人必定失败）。
+ *  这里改成先做带 status='active' 条件的原子 UPDATE，用 meta.changes 判断是否抢到。 */
 async function handleUseCode(db, id, ip) {
-  const row = await db.prepare('SELECT code, status FROM codes WHERE id = ?').bind(id).first();
-  if (!row) return json({ success: false, error: '该码不存在' }, 404);
-  if (row.status !== 'active') return json({ success: false, error: '该码已被使用' }, 409);
+  // 限流：防恶意脚本遍历 id 瞬间清空列表
+  if (await checkActionRateLimit(db, ip, 'use', CONFIG.USE_RATE_LIMIT)) {
+    return json({ success: false, error: '操作过于频繁，请稍后再试' }, 429);
+  }
 
-  await db
+  const upd = await db
     .prepare("UPDATE codes SET status = 'used', used_at = ? WHERE id = ? AND status = 'active'")
     .bind(now(), id)
     .run();
 
+  if (!upd.meta || upd.meta.changes === 0) {
+    // 没抢到：要么码不存在，要么已被别人用掉
+    const exists = await db.prepare('SELECT id FROM codes WHERE id = ?').bind(id).first();
+    return exists
+      ? json({ success: false, error: '该码已被使用' }, 409)
+      : json({ success: false, error: '该码不存在' }, 404);
+  }
+
+  const row = await db.prepare('SELECT code FROM codes WHERE id = ?').bind(id).first();
   await logAction(db, ip, '', 'use', `code_id:${id}`);
-  return json({ success: true, code: row.code, message: '已标记为已使用' });
+  return json({ success: true, code: row ? row.code : '', message: '已标记为已使用' });
 }
 
-/** POST /api/quick-use — 智能直达：取最新未使用码，标记使用并返回完整码 */
+/** POST /api/quick-use — 智能直达：取最新未使用码，标记使用并返回完整码（含 id，供前端本地标记"刚使用"）
+ *  同样用原子 UPDATE + 重试规避并发抢同一个码。 */
 async function handleQuickUse(db, ip) {
+  // 限流：与 use 共用同一计数（动作都是 use）
+  if (await checkActionRateLimit(db, ip, 'use', CONFIG.USE_RATE_LIMIT)) {
+    return json({ success: false, error: '操作过于频繁，请稍后再试' }, 429);
+  }
+
   // 智能直达开关
   const smartRaw = await getSetting(db, 'smart_enabled');
   if (smartRaw === 'off') {
     return json({ success: false, error: '智能直达已关闭' }, 403);
   }
 
-  // 取最新的未使用码
-  const row = await db
-    .prepare("SELECT id, code FROM codes WHERE status = 'active' ORDER BY created_at DESC LIMIT 1")
-    .first();
+  // 最多重试 3 次：每次取当前最新的 active 码并原子抢占，被别人抢走就换下一个
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await db
+      .prepare("SELECT id, code FROM codes WHERE status = 'active' ORDER BY created_at DESC LIMIT 1")
+      .first();
+    if (!row) break;
 
-  if (!row) {
-    return json({ success: false, error: '暂无可用互助码' }, 404);
+    const upd = await db
+      .prepare("UPDATE codes SET status = 'used', used_at = ? WHERE id = ? AND status = 'active'")
+      .bind(now(), row.id)
+      .run();
+
+    if (upd.meta && upd.meta.changes > 0) {
+      await logAction(db, ip, row.code, 'use', `quick_use code_id:${row.id}`);
+      return json({ success: true, code: row.code, id: row.id, message: '智能直达成功' });
+    }
   }
 
-  // 标记为已使用
-  await db
-    .prepare("UPDATE codes SET status = 'used', used_at = ? WHERE id = ? AND status = 'active'")
-    .bind(now(), row.id)
-    .run();
-
-  await logAction(db, ip, row.code, 'use', `quick_use code_id:${row.id}`);
-  return json({ success: true, code: row.code, message: '智能直达成功' });
+  return json({ success: false, error: '暂无可用互助码' }, 404);
 }
 
 /** POST /api/report/:id — 举报假码
- *  优化流程：同一提交者IP被2个不同IP举报 → 自动拉黑 + 举报自动通过
+ *  自动拉黑条件（三重加固，防被当武器用来拉黑正常用户）：
+ *   1) 只统计 24 小时内的举报（原来统计全表，历史举报会永久累积）
+ *   2) 需要 >= 3 个不同举报人 IP（原来 2 个，两台设备即可拉黑任意人）
+ *   3) 举报人 10 分钟内只能举报一次，且计票用 COUNT(DISTINCT ip) 去重
+ *   4) 提交者 IP 取不到（0.0.0.0）时不拉黑，否则会封掉所有取不到 IP 的用户
  */
-async function handleReportCode(db, id, ip, request) {
+async function handleReportCode(db, id, ip) {
   // 查询被举报的码及其提交者IP
   const row = await db.prepare('SELECT code, code_masked, ip, location FROM codes WHERE id = ?').bind(id).first();
   if (!row) return json({ success: false, error: '该码不存在' }, 404);
+
+  // 不允许举报自己提交的码（自举报可用于洗白或制造噪音）
+  if (row.ip && row.ip === ip) {
+    return json({ success: false, error: '不能举报自己提交的互助码' }, 400);
+  }
 
   // 防刷：同一举报人IP 10分钟内只能举报一次
   const since = new Date(Date.now() - 10 * 60_000).toISOString();
@@ -428,13 +585,19 @@ async function handleReportCode(db, id, ip, request) {
     .bind(row.code_masked, ip, row.ip, 'pending', now())
     .run();
 
-  // 检查该提交者IP是否被 >= 2 个不同IP举报
+  // 24 小时窗口内，该提交者IP被多少个不同IP举报
+  const banWindow = new Date(Date.now() - CONFIG.REPORT_AUTO_BAN_WINDOW_MS).toISOString();
   const reportStats = await db
-    .prepare('SELECT COUNT(DISTINCT ip) as cnt FROM reports WHERE submitter_ip = ?')
-    .bind(row.ip)
+    .prepare('SELECT COUNT(DISTINCT ip) as cnt FROM reports WHERE submitter_ip = ? AND created_at > ?')
+    .bind(row.ip, banWindow)
     .first();
 
-  if (reportStats && reportStats.cnt >= 2) {
+  if (reportStats && reportStats.cnt >= CONFIG.REPORT_AUTO_BAN_THRESHOLD) {
+    // 提交者 IP 缺失（非 CF 环境的 0.0.0.0 或历史空值）时绝不能拉黑：
+    // 那会把 blacklist 里塞进一条命中所有"取不到 IP"用户的规则，等于全站封禁。
+    if (!row.ip || row.ip === '0.0.0.0') {
+      return json({ success: true, message: '举报已提交，管理员会尽快核实' });
+    }
     // 自动拉黑提交者IP（默认24小时）
     const reason = '被多人举报假码（自动拉黑）';
     const location = row.location || '';
@@ -456,10 +619,13 @@ async function handleReportCode(db, id, ip, request) {
   return json({ success: true, message: '举报已提交，管理员会尽快核实' });
 }
 
-/** GET /api/blacklist — 小黑屋公示（公开、IP脱敏） */
+/** GET /api/blacklist — 小黑屋公示（公开、IP脱敏）
+ *  过滤掉已过期的记录：过期即自动解禁（checkBlacklist 会放行），
+ *  但公示页原来照旧展示，会让已解封的用户看到自己还"在小黑屋里"。 */
 async function handlePublicBlacklist(db) {
   const result = await db
-    .prepare('SELECT ip, reason, location, duration, expires_at, created_at FROM blacklist ORDER BY created_at DESC LIMIT 50')
+    .prepare('SELECT ip, reason, location, duration, expires_at, created_at FROM blacklist WHERE expires_at IS NULL OR expires_at > ? ORDER BY created_at DESC LIMIT 50')
+    .bind(now())
     .all();
 
   const masked = (result.results || []).map((row) => ({
@@ -545,17 +711,19 @@ function translateISP(isp) {
   return '';
 }
 
-/** 通过百度开放数据获取IP归属地（中文，HTTPS，高精度）
+/** 通过外部开放数据获取IP归属地（中文，全 HTTPS）
  *  返回格式示例："江苏省南京市 电信"、"美国"
- */
+ *  注意：ip 必须 encodeURIComponent 后再拼 URL —— 后台手动拉黑时 ip 来自管理员输入，
+ *  未编码的特殊字符可篡改 query 结构。 */
 async function fetchIPLocation(ip) {
   if (!ip || ip === '0.0.0.0') return '';
+  const q = encodeURIComponent(ip);
 
   // 方案1：百度开放数据 API（HTTPS，中文）
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch('https://opendata.baidu.com/api.php?query=' + ip + '&co=&resource_id=6006&oe=utf8', { signal: controller.signal });
+    const res = await fetch('https://opendata.baidu.com/api.php?query=' + q + '&co=&resource_id=6006&oe=utf8', { signal: controller.signal });
     clearTimeout(timeout);
     if (res.ok) {
       const data = await res.json();
@@ -565,23 +733,25 @@ async function fetchIPLocation(ip) {
     }
   } catch {}
 
-  // 方案2：ip-api.com（HTTP，中文地名+英文ISP→翻译）
+  // 方案2：ipwho.is（HTTPS 免费，中文地名 + ISP）
+  // 原来用的 http://ip-api.com 免费版只支持明文 HTTP，会在 Workers 与第三方之间裸奔传输用户 IP。
   try {
     const controller2 = new AbortController();
     const timeout2 = setTimeout(() => controller2.abort(), 5000);
-    const res2 = await fetch('http://ip-api.com/json/' + ip + '?lang=zh-CN&fields=country,regionName,city,isp', { signal: controller2.signal });
+    const res2 = await fetch('https://ipwho.is/' + q + '?lang=zh-CN&fields=success,country,region,city,connection', { signal: controller2.signal });
     clearTimeout(timeout2);
     if (res2.ok) {
-      const data2 = await res2.json();
-      const parts = [];
-      if (data2.country && data2.country !== '中国') parts.push(data2.country);
-      if (data2.regionName) parts.push(data2.regionName);
-      if (data2.city && data2.city !== data2.regionName) parts.push(data2.city);
-      // ISP 英文→中文翻译
-      const ispCn = translateISP(data2.isp || '');
-      if (ispCn) parts.push(ispCn);
-      const loc = parts.join(' ').trim();
-      if (loc) return loc;
+      const d = await res2.json();
+      if (d && d.success !== false) {
+        const parts = [];
+        if (d.country && d.country !== '中国') parts.push(d.country);
+        if (d.region) parts.push(d.region);
+        if (d.city && d.city !== d.region) parts.push(d.city);
+        const ispCn = translateISP((d.connection && (d.connection.isp || d.connection.org)) || '');
+        if (ispCn) parts.push(ispCn);
+        const loc = parts.join(' ').trim();
+        if (loc) return loc;
+      }
     }
   } catch {}
 
@@ -612,27 +782,81 @@ function getIPLocationSync(request) {
 //  管理后台 API
 // ============================================================
 
-/** 验证管理员密钥 */
-function verifyAdmin(request, env) {
-  const adminKey = request.headers.get('X-Admin-Key') || new URL(request.url).searchParams.get('key');
-  return adminKey && adminKey === env.ADMIN_KEY;
+/** 验证管理员密钥
+ *  只接受 X-Admin-Key 请求头（禁止 ?key= 查询参数，避免密钥进访问日志/Referer/浏览器历史）。
+ *  先各自 SHA-256 再逐字节比较：摘要长度恒为 32 字节，既不泄露真实密钥长度
+ *  （原实现 `length !== length` 提前返回会把长度暴露给攻击者），也保持恒时比较。 */
+async function verifyAdmin(request, env) {
+  const adminKey = request.headers.get('X-Admin-Key');
+  if (!adminKey || !env.ADMIN_KEY) return false;
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(adminKey)),
+    crypto.subtle.digest('SHA-256', enc.encode(env.ADMIN_KEY)),
+  ]);
+  const x = new Uint8Array(a);
+  const y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
 }
 
-/** GET /api/admin/blacklist — 获取黑名单列表 */
+/** 解析并收敛分页参数
+ *  原实现直接 parseInt 用户输入且无上限：pageSize=999999 可一次拖走整表，
+ *  page=0 / 负数会让 OFFSET 变负数导致 SQL 报错。
+ *  page 另需收敛上限：Number.isFinite(1e20) 为 true，但 (1e20-1)*50 已超出安全整数范围，
+ *  bind 进 D1 会抛异常冒泡成 500。 */
+function parsePaging(request) {
+  const url = new URL(request.url);
+  let page = parseInt(url.searchParams.get('page') || '1', 10);
+  let pageSize = parseInt(url.searchParams.get('pageSize') || '50', 10);
+  if (!Number.isSafeInteger(page) || page < 1) page = 1;
+  if (page > CONFIG.PAGE_MAX) page = CONFIG.PAGE_MAX;
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1) pageSize = 50;
+  if (pageSize > CONFIG.PAGE_SIZE_MAX) pageSize = CONFIG.PAGE_SIZE_MAX;
+  return { page, pageSize, offset: (page - 1) * pageSize };
+}
+
+/** IPv4 / IPv6 格式校验：手动拉黑接口原来接受任意字符串，
+ *  会往 blacklist 塞进永不命中的垃圾数据（cf-connecting-ip 永远不会等于它）。 */
+function isValidIP(ip) {
+  if (!ip || ip.length > 45) return false;
+  // IPv4：每段 0-255，且不允许 01 这类前导零写法（与 cf-connecting-ip 的规范格式不一致会永不命中）
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) {
+    return ip.split('.').every((p) => {
+      const n = Number(p);
+      return n >= 0 && n <= 255 && String(n) === p;
+    });
+  }
+  // IPv6（含压缩写法与 IPv4-mapped）
+  return ip.includes(':') && /^[0-9a-fA-F:]+(\.\d{1,3}){0,3}$/.test(ip);
+}
+
+/** GET /api/admin/blacklist — 获取黑名单列表
+ *  remaining 由服务端算：原来后台前端另写了一份 formatRemainingAdmin，
+ *  与 formatRemaining 逻辑完全重复（改一处忘另一处就会两边显示不一致）。 */
 async function handleAdminGetBlacklist(db) {
   const result = await db.prepare('SELECT id, ip, reason, location, duration, expires_at, created_at FROM blacklist ORDER BY created_at DESC').all();
-  return json({ success: true, data: result.results });
+  const data = (result.results || []).map((row) => ({
+    ...row,
+    remaining: formatRemaining(row.expires_at),
+  }));
+  return json({ success: true, data });
 }
 
 /** POST /api/admin/blacklist — 添加IP到黑名单 */
 async function handleAdminAddBlacklist(db, request) {
-  const body = await request.json();
-  const ip = body.ip?.trim();
-  const reason = body.reason?.trim() || '手动拉黑';
-  let location = body.location?.trim() || '';
-  const duration = body.duration?.trim() || '24h'; // 默认24小时
+  const body = await readJsonBody(request);
+  if (!body) return json({ success: false, error: '请求格式错误' }, 400);
+  const ip = String(body.ip || '').trim();
+  const reason = String(body.reason || '').trim().slice(0, 200) || '手动拉黑';
+  let location = String(body.location || '').trim().slice(0, 100);
+  const rawDuration = String(body.duration || '').trim();
+  // 期限白名单：任意字符串会被 calcExpiresAt 兜成 24h，但 duration 字段会存进脏值并展示到公示页
+  const duration = ['24h', '1m', '1y', 'permanent'].includes(rawDuration) ? rawDuration : '24h';
 
   if (!ip) return json({ success: false, error: 'IP不能为空' }, 400);
+  if (!isValidIP(ip)) return json({ success: false, error: 'IP 格式不合法' }, 400);
 
   // 归属地未填写时自动获取
   if (!location) {
@@ -641,9 +865,8 @@ async function handleAdminAddBlacklist(db, request) {
 
   const expiresAt = calcExpiresAt(duration);
 
-  // 支持 CIDR 前缀匹配（简单实现：检查前缀）
   await db
-    .prepare('INSERT OR REPLACE INTO blacklist (ip, reason, location, duration, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .prepare('INSERT INTO blacklist (ip, reason, location, duration, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(ip) DO UPDATE SET reason = excluded.reason, location = excluded.location, duration = excluded.duration, expires_at = excluded.expires_at, created_at = excluded.created_at')
     .bind(ip, reason, location, duration, expiresAt, now())
     .run();
 
@@ -653,109 +876,100 @@ async function handleAdminAddBlacklist(db, request) {
 /** DELETE /api/admin/blacklist — 从黑名单移除IP */
 async function handleAdminRemoveBlacklist(db, request) {
   const url = new URL(request.url);
-  const ip = url.searchParams.get('ip');
+  const ip = (url.searchParams.get('ip') || '').slice(0, 45);
   if (!ip) return json({ success: false, error: 'IP不能为空' }, 400);
 
-  await db.prepare('DELETE FROM blacklist WHERE ip = ?').bind(ip).run();
+  const res = await db.prepare('DELETE FROM blacklist WHERE ip = ?').bind(ip).run();
+  if (!res.meta || res.meta.changes === 0) {
+    return json({ success: false, error: `未找到 ${ip}` }, 404);
+  }
   return json({ success: true, message: `已移除 ${ip}` });
 }
 
-/** GET /api/admin/logs — 查看提交日志 */
-async function handleAdminGetLogs(db, request) {
-  const url = new URL(request.url);
-  const page = parseInt(url.searchParams.get('page') || '1');
-  const pageSize = parseInt(url.searchParams.get('pageSize') || '50');
-  const offset = (page - 1) * pageSize;
-
-  const result = await db
-    .prepare('SELECT ip, code, action, reason, created_at FROM submit_logs ORDER BY created_at DESC LIMIT ? OFFSET ?')
-    .bind(pageSize, offset)
-    .all();
-
-  const countResult = await db.prepare('SELECT COUNT(*) as total FROM submit_logs').first();
-
+/** 分页列表通用查询：数据页 + 总数一次 batch 取回
+ *  三个后台列表接口（logs / codes / reports）原本各自复制了一份
+ *  「SELECT ... LIMIT ? OFFSET ?」+「SELECT COUNT(*)」的串行两次往返。
+ *  注意：columns / table 只允许传本文件内的字面量常量（SQL 标识符无法参数化），
+ *  绝不可把请求参数透传进来，否则就是 SQL 注入入口。 */
+async function paginatedList(db, request, columns, table) {
+  const { page, pageSize, offset } = parsePaging(request);
+  const [rows, cnt] = await db.batch([
+    db.prepare(`SELECT ${columns} FROM ${table} ORDER BY created_at DESC LIMIT ? OFFSET ?`).bind(pageSize, offset),
+    db.prepare(`SELECT COUNT(*) as total FROM ${table}`),
+  ]);
+  const totalRow = cnt.results && cnt.results[0];
   return json({
     success: true,
-    data: result.results,
-    pagination: { page, pageSize, total: countResult.total },
+    data: rows.results || [],
+    pagination: { page, pageSize, total: (totalRow && totalRow.total) || 0 },
   });
 }
 
-/** GET /api/admin/stats — 统计数据 */
+/** GET /api/admin/logs — 查看提交日志 */
+function handleAdminGetLogs(db, request) {
+  return paginatedList(db, request, 'ip, code, action, reason, created_at', 'submit_logs');
+}
+
+/** GET /api/admin/stats — 统计数据（6 项指标一次 batch 取回，原来是 6 次串行 D1 往返） */
 async function handleAdminGetStats(db) {
-  const activeCount = await db.prepare("SELECT COUNT(*) as count FROM codes WHERE status = 'active'").first();
-  // 已使用：统计 submit_logs 中 action='use' 的累计条数（每次点击"跳转/已使用"都会落日志，不会被 30 秒清理删除），比 codes WHERE status='used' 实时数准确
-  const usedCount = await db.prepare("SELECT COUNT(*) as count FROM submit_logs WHERE action = 'use'").first();
-  const blacklistCount = await db.prepare('SELECT COUNT(*) as count FROM blacklist').first();
   // 基于北京时间（CST）今日 0:00，避免 Workers UTC 时区导致今日边界错位
-  const cstOfNow = new Date(Date.now() + 8 * 3600_000);
-  cstOfNow.setUTCHours(0, 0, 0, 0);
-  const todayStartMs = cstOfNow.getTime() - 8 * 3600_000;
-  const todayStartISO = new Date(todayStartMs).toISOString();
-  const todaySubmits = await db
-    .prepare("SELECT COUNT(*) as count FROM submit_logs WHERE created_at > ? AND action = 'submit'")
-    .bind(todayStartISO)
-    .first();
-  const todayBlocked = await db
-    .prepare("SELECT COUNT(*) as count FROM submit_logs WHERE created_at > ? AND action = 'blocked'")
-    .bind(todayStartISO)
-    .first();
-  const pendingReports = await db
-    .prepare("SELECT COUNT(*) as count FROM reports WHERE status = 'pending'")
-    .first();
+  const todayStartISO = getCSTTodayStartISO();
+  const rows = await db.batch([
+    db.prepare("SELECT COUNT(*) as c FROM codes WHERE status = 'active'"),
+    // 已使用：统计 submit_logs 中 action='use' 的累计条数（每次点击"跳转/已使用"都会落日志，
+    // 不会被 30 秒清理删除），比 codes WHERE status='used' 实时数准确
+    db.prepare("SELECT COUNT(*) as c FROM submit_logs WHERE action = 'use'"),
+    db.prepare('SELECT COUNT(*) as c FROM blacklist'),
+    db.prepare("SELECT COUNT(*) as c FROM submit_logs WHERE created_at > ? AND action = 'submit'").bind(todayStartISO),
+    db.prepare("SELECT COUNT(*) as c FROM submit_logs WHERE created_at > ? AND action = 'blocked'").bind(todayStartISO),
+    db.prepare("SELECT COUNT(*) as c FROM reports WHERE status = 'pending'"),
+  ]);
+  const n = (i) => {
+    const r = rows[i] && rows[i].results && rows[i].results[0];
+    return r ? (r.c || 0) : 0;
+  };
 
   return json({
     success: true,
     data: {
-      activeCodes: activeCount.count,
-      usedCodes: usedCount.count,
-      blacklistCount: blacklistCount.count,
-      todaySubmits: todaySubmits.count,
-      todayBlocked: todayBlocked.count,
-      pendingReports: pendingReports.count,
+      activeCodes: n(0),
+      usedCodes: n(1),
+      blacklistCount: n(2),
+      todaySubmits: n(3),
+      todayBlocked: n(4),
+      pendingReports: n(5),
     },
   });
 }
 
 /** GET /api/admin/codes — 管理员查看所有码（含完整码） */
-async function handleAdminGetAllCodes(db, request) {
-  const url = new URL(request.url);
-  const page = parseInt(url.searchParams.get('page') || '1');
-  const pageSize = parseInt(url.searchParams.get('pageSize') || '50');
-  const offset = (page - 1) * pageSize;
-
-  const result = await db
-    .prepare('SELECT id, code, code_masked, ip, status, created_at, used_at, location FROM codes ORDER BY created_at DESC LIMIT ? OFFSET ?')
-    .bind(pageSize, offset)
-    .all();
-
-  const countResult = await db.prepare('SELECT COUNT(*) as total FROM codes').first();
-
-  return json({
-    success: true,
-    data: result.results,
-    pagination: { page, pageSize, total: countResult.total },
-  });
+function handleAdminGetAllCodes(db, request) {
+  return paginatedList(db, request, 'id, code, code_masked, ip, status, created_at, used_at, location', 'codes');
 }
 
 /** DELETE /api/admin/codes/:id — 删除指定码 */
 async function handleAdminDeleteCode(db, id) {
-  await db.prepare('DELETE FROM codes WHERE id = ?').bind(id).run();
+  const res = await db.prepare('DELETE FROM codes WHERE id = ?').bind(id).run();
+  if (!res.meta || res.meta.changes === 0) {
+    return json({ success: false, error: '该码不存在' }, 404);
+  }
   return json({ success: true, message: '已删除' });
 }
 
 /** GET /api/admin/settings — 读取站点设置 */
 async function handleAdminGetSettings(db) {
-  const notice = (await getSetting(db, 'notice')) || '';
-  const adsRaw = (await getSetting(db, 'ads')) || '[]';
-  const qqGroup = (await getSetting(db, 'qq_group')) || '';
-  const qqOwner = (await getSetting(db, 'qq_owner')) || '';
-  const smartRaw = (await getSetting(db, 'smart_enabled')) || 'on';
-  const refreshInterval = (await getSetting(db, 'refresh_interval')) || '5';
-  const rateLimitMax = (await getSetting(db, 'rate_limit_max')) || String(CONFIG.RATE_LIMIT_MAX);
-  const dailyLimit = (await getSetting(db, 'daily_limit')) || String(CONFIG.DAILY_LIMIT);
-  const ocrModeRaw = (await getSetting(db, 'ocr_mode')) || 'local';
-  const ocrMode = (ocrModeRaw === 'ai') ? 'ai' : 'local';
+  const s = await getSettings(db, ['notice', 'ads', 'ad_title', 'ad_sub', 'qq_group', 'qq_owner', 'smart_enabled', 'refresh_interval', 'rate_limit_max', 'daily_limit', 'ocr_mode']);
+  const notice = s.notice || '';
+  const adsRaw = s.ads || '[]';
+  const adTitle = s.ad_title || '';
+  const adSub = s.ad_sub || '';
+  const qqGroup = s.qq_group || '';
+  const qqOwner = s.qq_owner || '';
+  const smartRaw = s.smart_enabled || 'on';
+  const refreshInterval = s.refresh_interval || '5';
+  const rateLimitMax = s.rate_limit_max || String(CONFIG.RATE_LIMIT_MAX);
+  const dailyLimit = s.daily_limit || String(CONFIG.DAILY_LIMIT);
+  const ocrMode = (s.ocr_mode === 'ai') ? 'ai' : 'local';
   let ads = [];
   try {
     ads = JSON.parse(adsRaw);
@@ -763,74 +977,74 @@ async function handleAdminGetSettings(db) {
   } catch {
     ads = [];
   }
-  return json({ success: true, data: { notice, ads, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartRaw, refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit, ocr_mode: ocrMode } });
+  return json({ success: true, data: { notice, ads, ad_title: adTitle, ad_sub: adSub, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartRaw !== 'off', refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit, ocr_mode: ocrMode } });
 }
 
-/** POST /api/admin/settings — 保存站点设置 */
+/** POST /api/admin/settings — 保存站点设置
+ *  原来每个字段各 await 一次 setSetting，一次保存最多 9 个串行写；改为收集后一次 batch 提交。
+ *  同时给所有文本字段加长度上限（公告原本无限长，可撑爆首页与 /api/config 响应体）。 */
 async function handleAdminSaveSettings(db, request) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ success: false, error: '请求格式错误' }, 400);
-  }
+  const body = await readJsonBody(request);
+  if (!body) return json({ success: false, error: '请求格式错误' }, 400);
 
-  // 公告：文本，去首尾空格（可为空）
+  const pending = {};
+
+  // 公告：文本，去首尾空格（可为空），限 500 字
   if (typeof body.notice === 'string') {
-    await setSetting(db, 'notice', body.notice.trim());
+    pending.notice = body.notice.trim().slice(0, 500);
   }
 
-  // 广告：数组，每项 { image_url, link_url }
+  // 广告：数组，每项 { image_url, link_url }；URL 过协议白名单防 XSS，最多 10 条
   if (Array.isArray(body.ads)) {
     const cleanAds = body.ads
-      .filter((ad) => ad && typeof ad.image_url === 'string' && ad.image_url.trim())
+      .slice(0, 10)
+      .filter((ad) => ad && typeof ad.image_url === 'string' && sanitizeUrl(ad.image_url))
       .map((ad) => ({
-        image_url: ad.image_url.trim().slice(0, 500),
-        link_url: (ad.link_url && ad.link_url.trim().slice(0, 500)) || '',
+        image_url: sanitizeUrl(ad.image_url).slice(0, 500),
+        link_url: sanitizeUrl(ad.link_url).slice(0, 500),
       }));
-    await setSetting(db, 'ads', JSON.stringify(cleanAds));
+    pending.ads = JSON.stringify(cleanAds);
   }
+
+  // 弹窗广告文案：留空则首页弹窗不显示标题栏
+  if (typeof body.ad_title === 'string') pending.ad_title = body.ad_title.trim().slice(0, 60);
+  if (typeof body.ad_sub === 'string') pending.ad_sub = body.ad_sub.trim().slice(0, 120);
 
   // 联系方式
-  if (typeof body.qq_group === 'string') {
-    await setSetting(db, 'qq_group', body.qq_group.trim().slice(0, 50));
-  }
-  if (typeof body.qq_owner === 'string') {
-    await setSetting(db, 'qq_owner', body.qq_owner.trim().slice(0, 50));
-  }
+  if (typeof body.qq_group === 'string') pending.qq_group = body.qq_group.trim().slice(0, 50);
+  if (typeof body.qq_owner === 'string') pending.qq_owner = body.qq_owner.trim().slice(0, 50);
+
   // 智能直达开关 on/off
   if (body.smart_enabled === 'on' || body.smart_enabled === 'off') {
-    await setSetting(db, 'smart_enabled', body.smart_enabled);
+    pending.smart_enabled = body.smart_enabled;
   }
 
-  // 刷新间隔：3-30 秒
-  if (typeof body.refresh_interval === 'string' || typeof body.refresh_interval === 'number') {
-    const ri = parseInt(String(body.refresh_interval), 10);
-    if (!isNaN(ri) && ri >= 3 && ri <= 30) {
-      await setSetting(db, 'refresh_interval', String(ri));
-    }
-  }
-
-  // 单IP每分钟提交上限：1-60
-  if (typeof body.rate_limit_max === 'string' || typeof body.rate_limit_max === 'number') {
-    const rlm = parseInt(String(body.rate_limit_max), 10);
-    if (!isNaN(rlm) && rlm >= 1 && rlm <= 60) {
-      await setSetting(db, 'rate_limit_max', String(rlm));
-    }
-  }
-
-  // 单IP每日提交上限：1-2000
-  if (typeof body.daily_limit === 'string' || typeof body.daily_limit === 'number') {
-    const dl = parseInt(String(body.daily_limit), 10);
-    if (!isNaN(dl) && dl >= 1 && dl <= 2000) {
-      await setSetting(db, 'daily_limit', String(dl));
-    }
+  // 数值型设置：字段名 -> [最小值, 最大值]
+  const numericRanges = {
+    refresh_interval: [3, 30],    // 首页刷新间隔（秒）
+    rate_limit_max: [1, 60],      // 单IP每分钟提交上限
+    daily_limit: [1, 2000],       // 单IP每日提交上限
+  };
+  for (const [key, [min, max]] of Object.entries(numericRanges)) {
+    const raw = body[key];
+    if (typeof raw !== 'string' && typeof raw !== 'number') continue;
+    const v = parseInt(String(raw), 10);
+    if (!isNaN(v) && v >= min && v <= max) pending[key] = String(v);
   }
 
   // OCR 模式：ai（仅服务端）/ local（浏览器本地优先）
   if (body.ocr_mode === 'ai' || body.ocr_mode === 'local') {
-    await setSetting(db, 'ocr_mode', body.ocr_mode);
+    pending.ocr_mode = body.ocr_mode;
   }
+
+  const keys = Object.keys(pending);
+  if (keys.length === 0) return json({ success: true, message: '无需更新' });
+
+  const ts = now();
+  await db.batch(keys.map((k) =>
+    db.prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+      .bind(k, pending[k], ts)
+  ));
 
   return json({ success: true, message: '设置已保存' });
 }
@@ -838,39 +1052,31 @@ async function handleAdminSaveSettings(db, request) {
 // ---------- 举报管理 ----------
 
 /** GET /api/admin/reports — 举报列表 */
-async function handleAdminGetReports(db, request) {
-  const url = new URL(request.url);
-  const page = parseInt(url.searchParams.get('page') || '1');
-  const pageSize = parseInt(url.searchParams.get('pageSize') || '50');
-  const offset = (page - 1) * pageSize;
-
-  const result = await db
-    .prepare('SELECT id, code, ip, submitter_ip, status, created_at FROM reports ORDER BY created_at DESC LIMIT ? OFFSET ?')
-    .bind(pageSize, offset)
-    .all();
-  const countResult = await db.prepare('SELECT COUNT(*) as total FROM reports').first();
-
-  return json({
-    success: true,
-    data: result.results,
-    pagination: { page, pageSize, total: countResult.total },
-  });
+function handleAdminGetReports(db, request) {
+  return paginatedList(db, request, 'id, code, ip, submitter_ip, status, created_at', 'reports');
 }
 
 /** POST /api/admin/reports/:id/status — 更新举报状态（handled/dismissed） */
 async function handleAdminUpdateReport(db, id, request) {
-  const body = await request.json();
+  const body = await readJsonBody(request);
+  if (!body) return json({ success: false, error: '请求格式错误' }, 400);
   const status = body.status;
   if (!['handled', 'dismissed', 'pending'].includes(status)) {
     return json({ success: false, error: '状态不合法' }, 400);
   }
-  await db.prepare('UPDATE reports SET status = ? WHERE id = ?').bind(status, id).run();
+  const res = await db.prepare('UPDATE reports SET status = ? WHERE id = ?').bind(status, id).run();
+  if (!res.meta || res.meta.changes === 0) {
+    return json({ success: false, error: '该举报不存在' }, 404);
+  }
   return json({ success: true, message: '已更新' });
 }
 
 /** DELETE /api/admin/reports/:id — 删除举报记录 */
 async function handleAdminDeleteReport(db, id) {
-  await db.prepare('DELETE FROM reports WHERE id = ?').bind(id).run();
+  const res = await db.prepare('DELETE FROM reports WHERE id = ?').bind(id).run();
+  if (!res.meta || res.meta.changes === 0) {
+    return json({ success: false, error: '该举报不存在' }, 404);
+  }
   return json({ success: true, message: '已删除' });
 }
 
@@ -878,28 +1084,56 @@ async function handleAdminDeleteReport(db, id) {
  *  ocr_mode: local(默认, 由前端浏览器本地识别, 后端返回 fallback) / ai(仅服务端AI识别)
  *  前端默认走浏览器本地识别；用户选择「用AI识别」时带 ?force=ai 调用本接口
  */
-async function handleOcr(request, env) {
+const OCR_MODEL = '@cf/meta/llama-3.2-11b-vision-instruct';
+const OCR_PROMPT = 'Look at this image carefully. It is from Pinduoduo (拼多多). There is an invitation code shown as a string of 8 or 9 digits (like 12345678 or 123456789). What is the invitation code? Reply with ONLY the digits, no other text.';
+
+async function handleOcr(request, env, ip) {
   try {
     // 支持 ?force=ai 强制走 AI（前端「用 AI 识别」按钮）
-    var forceAi = false;
-    try { forceAi = new URL(request.url).searchParams.get('force') === 'ai'; } catch(e) {}
+    let forceAi = false;
+    try { forceAi = new URL(request.url).searchParams.get('force') === 'ai'; } catch (e) {}
 
-    // OCR 模式（auto / ai / local），force=ai 时强制为 ai
+    // OCR 模式（ai / local），force=ai 时强制为 ai
     const ocrModeRaw = await getSetting(env.DB, 'ocr_mode');
     let ocrMode = (ocrModeRaw === 'ai') ? 'ai' : 'local';
     if (forceAi) ocrMode = 'ai';
 
-    // 从 FormData 中读取图片
-    const formData = await request.formData();
-    const file = formData.get('image');
-    if (!file) {
-      return json({ success: false, error: '未收到图片' }, 400);
-    }
-
-    // local 模式：不消耗 AI 额度，直接让前端用浏览器本地识别
+    // local 模式：不消耗 AI 额度也不需要读图，尽早返回让前端走浏览器本地识别。
+    // 放在 formData() 之前：否则每个 local 模式请求都要先把整个 body 解析一遍才被拒。
     if (ocrMode === 'local') {
       return json({ success: false, fallback: 'local', error: '请使用浏览器本地识别' });
     }
+
+    // 从 FormData 中读取图片（非 multipart body 会抛异常，明确回 400 而不是走兜底错误）
+    let formData;
+    try {
+      formData = await request.formData();
+    } catch {
+      return json({ success: false, error: '未收到图片' }, 400);
+    }
+    const file = formData.get('image');
+    if (!file || typeof file.arrayBuffer !== 'function') {
+      // 非文件（例如脚本传了普通字符串字段）直接拒绝，避免下面 arrayBuffer 抛异常
+      return json({ success: false, error: '未收到图片' }, 400);
+    }
+
+    // 服务端图片大小限制（前端限制可被脚本绕过）
+    if (file.size && file.size > CONFIG.OCR_MAX_IMG_BYTES) {
+      return json({ success: false, error: '图片太大，请选小于 4MB 的截图' }, 413);
+    }
+
+    // MIME 白名单：只允许常见图片类型，防把任意二进制塞给 AI 模型
+    const mimeType = (file.type || 'image/png').toLowerCase().split(';')[0].trim();
+    if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif', 'image/bmp'].includes(mimeType)) {
+      return json({ success: false, error: '仅支持 PNG / JPG / WebP 等图片格式' }, 415);
+    }
+
+    // AI 路径限流：防 AI 额度被盗刷（无鉴权公开接口）
+    if (await checkActionRateLimit(env.DB, ip, 'ocr_ai', CONFIG.OCR_AI_RATE_LIMIT)) {
+      return json({ success: false, error: 'AI 识别调用过于频繁，请稍后再试或手动输入' }, 429);
+    }
+    // 调用前记日志作为限流计数（失败也消耗额度，一并计数）
+    await logAction(env.DB, ip, '', 'ocr_ai', 'ok');
 
     // 转为 base64 传给 AI 模型（llama-3.2 vision 支持 messages 格式的 image_url）
     const imageBuffer = await file.arrayBuffer();
@@ -911,50 +1145,39 @@ async function handleOcr(request, env) {
       binStr += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
     }
     const base64 = btoa(binStr);
-    const mimeType = file.type || 'image/png';
 
     // 调用 Cloudflare Workers AI 视觉模型（llama-3.2-11b-vision-instruct）
-    // 使用 messages 格式，content 数组中包含 text 和 image_url
+    // payload 抽出来复用，避免 agree-license 重试时复制粘贴一整份（两份 prompt 容易改漏）
+    const aiPayload = {
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: OCR_PROMPT },
+            { type: 'image_url', image_url: { url: 'data:' + mimeType + ';base64,' + base64 } },
+          ],
+        },
+      ],
+      max_tokens: 20,
+      temperature: 0.1,
+    };
+
     let aiResponse;
     try {
-      aiResponse = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', {
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: 'Look at this image carefully. It is from Pinduoduo (拼多多). There is an invitation code shown as a string of 8 or 9 digits (like 12345678 or 123456789). What is the invitation code? Reply with ONLY the digits, no other text.' },
-              { type: 'image_url', image_url: { url: 'data:' + mimeType + ';base64,' + base64 } }
-            ]
-          }
-        ],
-        max_tokens: 20,
-        temperature: 0.1,
-      });
-    } catch(e) {
-      var errStr = String(e.message || e);
+      aiResponse = await env.AI.run(OCR_MODEL, aiPayload);
+    } catch (e) {
+      const errStr = String((e && e.message) || e);
       // 如果需要 agree Meta License，先 agree 再重试
-      if (errStr.includes('agree') || errStr.includes('license') || errStr.includes('3016') || errStr.includes('5016')) {
-        try { await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', { prompt: 'agree' }); } catch(e2) {}
-        aiResponse = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', {
-          messages: [
-            {
-              role: 'user',
-              content: [
-                { type: 'text', text: 'Look at this image carefully. It is from Pinduoduo (拼多多). There is an invitation code shown as a string of 8 or 9 digits (like 12345678 or 123456789). What is the invitation code? Reply with ONLY the digits, no other text.' },
-                { type: 'image_url', image_url: { url: 'data:' + mimeType + ';base64,' + base64 } }
-              ]
-            }
-          ],
-          max_tokens: 20,
-          temperature: 0.1,
-        });
+      if (/agree|license|3016|5016/.test(errStr)) {
+        try { await env.AI.run(OCR_MODEL, { prompt: 'agree' }); } catch (e2) {}
+        aiResponse = await env.AI.run(OCR_MODEL, aiPayload);
       } else {
         throw e;
       }
     }
 
     // 安全获取 AI 返回文本（不同格式兼容；response 可能是数字类型）
-    var rawText = '';
+    let rawText = '';
     if (aiResponse) {
       if (typeof aiResponse.response === 'string') {
         rawText = aiResponse.response.trim();
@@ -968,31 +1191,20 @@ async function handleOcr(request, env) {
     }
 
     // 清理 markdown 符号和空白，只留数字
-    var cleaned = rawText.replace(/[^0-9]/g, ' ');
+    const cleaned = rawText.replace(/[^0-9]/g, ' ');
 
-    // 优先提取连续的 8 或 9 位数字（用户要求：识别逻辑为连续八位或九位数）
-    var matches = cleaned.match(/\d{8,9}/g) || [];
-    // 排除超过 9 位的（如从更长数字串中切出来的），并去重
-    var valid = matches.filter(function(s) { return s.length === 8 || s.length === 9; });
-    if (valid.length > 0) {
-      var code = valid[0];
-      return json({
-        success: true,
-        code: code,
-        rawText: rawText.slice(0, 100),
-      });
+    // 优先提取连续的 8 或 9 位数字（识别逻辑：连续八位或九位数）
+    const matches = cleaned.match(/\d{8,9}/g) || [];
+    if (matches.length > 0) {
+      return json({ success: true, code: matches[0], rawText: rawText.slice(0, 100) });
     }
 
-    // 兜底：无 8/9 位数字时，取最长的数字串（至少 6 位才认为可信）
-    var allNums = cleaned.match(/\d+/g) || [];
+    // 兜底：无 8/9 位数字时，取最长的数字串（6~12 位才认为可信）
+    const allNums = cleaned.match(/\d+/g) || [];
     if (allNums.length > 0) {
-      var longest = allNums.sort(function(a, b) { return b.length - a.length; })[0];
+      const longest = allNums.sort((a, b) => b.length - a.length)[0];
       if (longest.length >= 6 && longest.length <= 12) {
-        return json({
-          success: true,
-          code: longest,
-          rawText: rawText.slice(0, 100),
-        });
+        return json({ success: true, code: longest, rawText: rawText.slice(0, 100) });
       }
     }
 
@@ -1002,13 +1214,8 @@ async function handleOcr(request, env) {
     });
   } catch(e) {
     console.error('handleOcr error:', e);
-    const msg = String(e && e.message ? e.message : e);
-    const isQuota = /429|quota|rate.?limit|exceed|neuron|too many|capacity|rest/i.test(msg);
-    if (ocrMode === 'auto') {
-      // auto：AI 失败（含额度受限）一律静默切本地
-      return json({ success: false, fallback: 'local', error: isQuota ? 'AI 额度受限，已切换浏览器本地识别' : 'AI 识别失败，已切换浏览器本地识别' });
-    }
-    // ai 模式（含 force=ai）：额度受限或出错都友好提示手动输入
+    // ai 模式（含 force=ai）：额度受限或出错都友好提示手动输入；
+    // local 模式在上面已提前返回，走不到这里，故不再保留 auto 分支（该模式已废弃）。
     return json({ success: false, error: '抱歉，识别出错，请手动输入互助码' });
   }
 }
@@ -1026,9 +1233,20 @@ async function handleAPI(request, env, path, ctx) {
     return new Response(null, { status: 204 });
   }
 
+  // ---- 全局黑名单拦截 ----
+  // 原来只有 /api/submit 查黑名单，被拉黑的 IP 依然能领码（清空列表）、举报（武器化自动拉黑）、
+  // 刷 AI 识图额度。这里统一在入口拦所有公开写接口。
+  if (BLACKLIST_GUARDED.some((r) => r.method === method && r.test(path))) {
+    const blocked = await checkBlacklist(env.DB, ip);
+    if (blocked) {
+      await logAction(env.DB, ip, '', 'blocked', `blacklist@${path}: ${blocked.reason || ''}`);
+      return json({ success: false, error: '您的IP已被拉黑，如需申诉请联系管理员' }, 403);
+    }
+  }
+
   // ---- 公开接口 ----
   if (path === '/api/codes' && method === 'GET') {
-    return handleGetCodes(env.DB);
+    return handleGetCodes(env.DB, ctx);
   }
 
   if (path === '/api/config' && method === 'GET') {
@@ -1045,7 +1263,7 @@ async function handleAPI(request, env, path, ctx) {
 
   // 识图提取（Cloudflare Workers AI 视觉模型）
   if (path === '/api/ocr' && method === 'POST') {
-    return handleOcr(request, env);
+    return handleOcr(request, env, ip);
   }
 
   // 智能直达
@@ -1061,18 +1279,27 @@ async function handleAPI(request, env, path, ctx) {
   // 举报假码：/api/report/123
   const reportMatch = path.match(/^\/api\/report\/(\d+)$/);
   if (reportMatch && method === 'POST') {
-    return handleReportCode(env.DB, parseInt(reportMatch[1]), ip, request);
+    const rid = parseId(reportMatch[1]);
+    if (rid === null) return json({ success: false, error: '该码不存在' }, 404);
+    return handleReportCode(env.DB, rid, ip);
   }
 
   // 标记使用：/api/use/123
   const useMatch = path.match(/^\/api\/use\/(\d+)$/);
   if (useMatch && method === 'POST') {
-    return handleUseCode(env.DB, parseInt(useMatch[1]), ip);
+    const uid = parseId(useMatch[1]);
+    if (uid === null) return json({ success: false, error: '该码不存在' }, 404);
+    return handleUseCode(env.DB, uid, ip);
   }
 
   // ---- 管理后台接口 ----
   if (path.startsWith('/api/admin/')) {
-    if (!verifyAdmin(request, env)) {
+    if (!(await verifyAdmin(request, env))) {
+      // 鉴权失败落日志 + 限流：ADMIN_KEY 是唯一凭据，不限流就能被脚本无限枚举
+      if (await checkActionRateLimit(env.DB, ip, 'admin_fail', CONFIG.ADMIN_FAIL_LIMIT)) {
+        return json({ success: false, error: '尝试过于频繁，请稍后再试' }, 429);
+      }
+      await logAction(env.DB, ip, '', 'admin_fail', path);
       return json({ success: false, error: '未授权' }, 401);
     }
 
@@ -1096,7 +1323,9 @@ async function handleAPI(request, env, path, ctx) {
     }
     const deleteMatch = path.match(/^\/api\/admin\/codes\/(\d+)$/);
     if (deleteMatch && method === 'DELETE') {
-      return handleAdminDeleteCode(env.DB, parseInt(deleteMatch[1]));
+      const cid = parseId(deleteMatch[1]);
+      if (cid === null) return json({ success: false, error: '该码不存在' }, 404);
+      return handleAdminDeleteCode(env.DB, cid);
     }
     if (path === '/api/admin/settings' && method === 'GET') {
       return handleAdminGetSettings(env.DB);
@@ -1109,11 +1338,15 @@ async function handleAPI(request, env, path, ctx) {
     }
     const reportStatusMatch = path.match(/^\/api\/admin\/reports\/(\d+)\/status$/);
     if (reportStatusMatch && method === 'POST') {
-      return handleAdminUpdateReport(env.DB, parseInt(reportStatusMatch[1]), request);
+      const rsid = parseId(reportStatusMatch[1]);
+      if (rsid === null) return json({ success: false, error: '该举报不存在' }, 404);
+      return handleAdminUpdateReport(env.DB, rsid, request);
     }
     const reportDeleteMatch = path.match(/^\/api\/admin\/reports\/(\d+)$/);
     if (reportDeleteMatch && method === 'DELETE') {
-      return handleAdminDeleteReport(env.DB, parseInt(reportDeleteMatch[1]));
+      const rdid = parseId(reportDeleteMatch[1]);
+      if (rdid === null) return json({ success: false, error: '该举报不存在' }, 404);
+      return handleAdminDeleteReport(env.DB, rdid);
     }
   }
 
@@ -1131,9 +1364,15 @@ async function servePage(pageName) {
   };
   const html = pages[pageName];
   if (!html) return new Response('Not Found', { status: 404 });
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
-  });
+  const extra = { 'Content-Type': 'text/html; charset=utf-8' };
+  // 后台页不进搜索引擎索引，也不缓存（避免 /admin 被爬到并暴露入口）
+  if (pageName === 'admin') {
+    extra['X-Robots-Tag'] = 'noindex, nofollow, noarchive';
+    extra['Cache-Control'] = 'no-store';
+  } else {
+    extra['Cache-Control'] = 'public, max-age=300';
+  }
+  return new Response(html, { headers: securityHeaders(extra) });
 }
 
 // ============================================================
@@ -1145,16 +1384,24 @@ function getCSTDate() {
   return new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
-/** 每日清空：删除所有互助码，记录清理日期 */
+/** 每日清空：删除所有互助码，并按保留期清理日志类表（避免 D1 无限膨胀） */
 async function dailyCleanup(db) {
   const today = getCSTDate();
   const last = await db.prepare("SELECT value FROM settings WHERE key = 'last_cleanup_date'").first();
   if (last && last.value === today) return false; // 今天已清理
 
-  // 清空所有互助码
-  await db.prepare("DELETE FROM codes").run();
-  // 更新清理日期
-  await db.prepare("INSERT INTO settings (key, value, updated_at) VALUES ('last_cleanup_date', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").bind(today, now()).run();
+  const cutoff = new Date(Date.now() - CONFIG.LOG_KEEP_DAYS * 24 * 3600_000).toISOString();
+
+  // 清空所有互助码 + 清理各日志表（visits / reports 原来只增不减，会一直吃 D1 行数配额）
+  await db.batch([
+    db.prepare("DELETE FROM codes"),
+    db.prepare("DELETE FROM submit_logs WHERE created_at < ?").bind(cutoff),
+    db.prepare("DELETE FROM visits WHERE created_at < ?").bind(cutoff),
+    db.prepare("DELETE FROM reports WHERE created_at < ? AND status != 'pending'").bind(cutoff),
+    // 顺手清掉已过期的黑名单记录（checkBlacklist 只在命中时才懒清理）
+    db.prepare("DELETE FROM blacklist WHERE expires_at IS NOT NULL AND expires_at < ?").bind(now()),
+    db.prepare("INSERT INTO settings (key, value, updated_at) VALUES ('last_cleanup_date', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").bind(today, now()),
+  ]);
   return true;
 }
 
@@ -1170,12 +1417,20 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // 请求体大小闸门：Workers 本身没有默认上限，超大 body 会白白吃 CPU 时间
+    // （/api/ocr 的图片走 formData，单独用 OCR_MAX_IMG_BYTES 判定，此处放宽到 8MB）
+    const declaredLen = parseInt(request.headers.get('content-length') || '0', 10);
+    if (declaredLen > 8 * 1024 * 1024) {
+      return json({ success: false, error: '请求体过大' }, 413);
+    }
+
     // API 路由
     if (path.startsWith('/api/')) {
       try {
         return await handleAPI(request, env, path, ctx);
       } catch (err) {
-        console.error(err);
+        // 只在服务端日志留细节，响应体不回传任何堆栈/SQL 信息
+        console.error('[api]', path, err);
         return json({ success: false, error: '服务器内部错误' }, 500);
       }
     }
@@ -1193,13 +1448,23 @@ export default {
       return servePage('admin');
     }
 
+    // 明确告知爬虫不要收录后台
+    if (path === '/robots.txt') {
+      return new Response('User-agent: *\nDisallow: /admin\nDisallow: /api/\n', {
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      });
+    }
+
     return new Response('Not Found', { status: 404 });
   },
 
-  // Cron Trigger: 每天 23:59 CST (15:59 UTC) 清空互助码
-  async scheduled(event, env) {
-    const db = env.DB;
-    await dailyCleanup(db);
+  // Cron Trigger: 每天 23:59 CST (15:59 UTC) 清空互助码 + 清理历史日志
+  async scheduled(event, env, ctx) {
+    try {
+      await dailyCleanup(env.DB);
+    } catch (err) {
+      console.error('[cron] dailyCleanup failed:', err);
+    }
   },
 };
 
@@ -1245,7 +1510,6 @@ summary::-webkit-details-marker{display:none}
 summary::before{content:"▸ ";margin-right:4px}
 details[open] summary::before{content:"▾ "}
 .instruction-list{line-height:1.8;color:#4b5563;margin:10px 0 0 20px;padding:0;font-size:14px}
-.entry-img{display:block;width:100%;max-width:400px;height:auto;border-radius:12px;box-shadow:0 6px 16px rgba(0,0,0,.1);margin:15px auto 0}
 
 /* 滚动公告 */
 .custom-notice-bar{display:flex;align-items:center;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.03);border:1px solid #f1f5f9;padding:8px 10px 8px 0;margin-bottom:15px;position:relative;overflow:hidden;height:44px;box-sizing:border-box}
@@ -1399,7 +1663,6 @@ summary{font-size:14px}
         <li>如果码没被点，再次提交该码即可重新进入队列。</li>
         <li>活动入口：拼多多首页 - 百亿补贴 - 百亿消费券 - 福袋</li>
       </ul>
-      <img class="entry-img" id="entryImg" src="" alt="活动入口" loading="lazy" style="display:none">
     </details>
 
   </div>
@@ -1451,12 +1714,12 @@ summary{font-size:14px}
 
 </div>
 
-<!-- 弹窗广告：有广告配置时展示，可关闭 -->
+<!-- 弹窗广告：有广告配置时展示，可关闭。标题/副标题由后台设置注入，未配置则整块不渲染 -->
 <div class="ad-pop" id="adPop">
   <button class="ad-close" onclick="closeAdPop()">×</button>
-  <div class="ad-head">
-    <div class="t">外卖·打车 每日必领神券</div>
-    <div class="s">美团 · 淘宝闪购 · 京东｜外卖打车全线折上折</div>
+  <div class="ad-head" id="adPopHead" style="display:none">
+    <div class="t" id="adPopTitle"></div>
+    <div class="s" id="adPopSub"></div>
   </div>
   <div class="ad-links" id="adPopLinks"></div>
 </div>
@@ -1491,6 +1754,20 @@ function showToast(msg, type) {
   t.textContent = msg;
   t.className = 'toast show ' + (type || 'success');
   setTimeout(function(){ t.className = 'toast'; }, 2500);
+}
+
+/** HTML 转义：所有拼进 innerHTML 的动态值（归属地、联系方式、公告等）必须先转义，防存储型 XSS */
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+    return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+  });
+}
+
+/** 链接协议白名单：只允许 http/https，拒绝 javascript:/data: 等（配合后端 sanitizeUrl 双保险） */
+function safeHref(u) {
+  var s = String(u || '').trim();
+  if (s.indexOf('http://') === 0 || s.indexOf('https://') === 0) return escapeHtml(s);
+  return 'javascript:void(0)';
 }
 
 async function submitCode() {
@@ -1789,7 +2066,7 @@ async function loadCodes(fromAutoRefresh) {
         var timeStr = (time.getMonth()+1) + '/' + time.getDate() + ' ' +
           String(time.getHours()).padStart(2,'0') + ':' + String(time.getMinutes()).padStart(2,'0');
         var loc = item.location || '';
-        var locShort = loc ? loc.substring(0, 12) : '';
+        var locShort = escapeHtml(loc.substring(0, 12));
         var metaStr = locShort ? timeStr + ' · ' + locShort : timeStr;
         var actionsHtml, usedCls = '';
         if (item.status === 'active') {
@@ -1806,7 +2083,7 @@ async function loadCodes(fromAutoRefresh) {
           }
         }
         return '<li class="list-item' + usedCls + '">' +
-          '<div class="info"><span class="number">' + item.code_masked + '</span>' +
+          '<div class="info"><span class="number">' + escapeHtml(item.code_masked) + '</span>' +
           '<div class="meta">' + metaStr + '</div></div>' +
           '<div class="actions">' + actionsHtml + '</div>' +
         '</li>';
@@ -1923,8 +2200,8 @@ async function quickUse() {
     var res = await fetch('/api/quick-use', { method: 'POST' });
     var data = await res.json();
     if (data.success) {
-      addQuickUsedFromResponse(data);
-      // 标记为"刚使用"（需要拿到 id —— 智能直达接口返回完整码，前端从列表匹配）
+      // 后端直接返回 id，本地标记"刚使用"（无需再模糊匹配）
+      addQuickUsed(data.id);
       openPddDelayed(data.code, '智能直达成功');
       setTimeout(loadCodes, 600);
     } else {
@@ -1935,23 +2212,6 @@ async function quickUse() {
   } finally {
     setTimeout(function(){ btn.disabled = false; }, 1500);
   }
-}
-
-/** 智能直达成功后：把对应列表项的 id 记入"刚使用"集合 */
-async function addQuickUsedFromResponse(data) {
-  try {
-    var res = await fetch('/api/codes');
-    var list = await res.json();
-    var codes = list.data || [];
-    var match = codes.find(function(x){ return x.status === 'used'; });
-    // 用完整码前3位+后3位模糊匹配（列表只有脱敏码）
-    var head = data.code.slice(0, 3), tail = data.code.slice(-3);
-    var found = codes.find(function(x){
-      var m = x.code_masked.replace(/\\*/g, '');
-      return x.code_masked.startsWith(head) && x.code_masked.endsWith(tail) && m.length === head.length + tail.length;
-    });
-    if (found) addQuickUsed(found.id);
-  } catch(e) {}
 }
 
 /** 举报假码 */
@@ -1976,7 +2236,8 @@ function showNoticeModal() {
   var txt = document.getElementById('noticeText').textContent;
   var modal = document.createElement('div');
   modal.className = 'modal-mask show';
-  modal.innerHTML = '<div class="modal"><button class="close-x" onclick="this.parentNode.parentNode.remove()">×</button><h2>📢 公告详情</h2><p style="white-space:pre-line;font-size:15px;line-height:1.8;color:#333">' + txt + '</p></div>';
+  // txt 来自后台公告（textContent 读出的原文），拼进 innerHTML 前必须转义
+  modal.innerHTML = '<div class="modal"><button class="close-x" onclick="this.parentNode.parentNode.remove()">×</button><h2>📢 公告详情</h2><p style="white-space:pre-line;font-size:15px;line-height:1.8;color:#333">' + escapeHtml(txt) + '</p></div>';
   document.body.appendChild(modal);
   modal.addEventListener('click', function(e){ if (e.target === modal) modal.remove(); });
 }
@@ -1988,13 +2249,13 @@ function openContact() {
   var qqOwner = window._cfg && window._cfg.qq_owner;
   var html = '';
   if (qqGroup) {
-    html += '<div class="contact-item"><strong>🚀 官方交流互助群</strong><p>群号：' + qqGroup + ' (进群不迷路，第一时间获取系统升级信息和福袋活动开放消息)</p></div>';
+    html += '<div class="contact-item"><strong>🚀 官方交流互助群</strong><p>群号：' + escapeHtml(qqGroup) + ' (进群不迷路，第一时间获取系统升级信息和福袋活动开放消息)</p></div>';
     document.getElementById('qqJoinBtn').style.display = 'block';
   } else {
     document.getElementById('qqJoinBtn').style.display = 'none';
   }
   if (qqOwner) {
-    html += '<div class="contact-item"><strong>🛡️ 站长 QQ</strong><p>QQ号：' + qqOwner + ' (如遇被封禁申诉、或功能建议反馈，请联系我，也可以进群联系群主)</p></div>';
+    html += '<div class="contact-item"><strong>🛡️ 站长 QQ</strong><p>QQ号：' + escapeHtml(qqOwner) + ' (如遇被封禁申诉、或功能建议反馈，请联系我，也可以进群联系群主)</p></div>';
   }
   if (!html) { showToast('暂未配置联系方式', 'error'); return; }
   body.innerHTML = html;
@@ -2024,8 +2285,8 @@ async function openBlacklist() {
         var t = new Date(r.created_at);
         var ts = String(t.getMonth()+1).padStart(2,'0') + '-' + String(t.getDate()).padStart(2,'0') + ' ' +
           String(t.getHours()).padStart(2,'0') + ':' + String(t.getMinutes()).padStart(2,'0');
-        var remaining = r.remaining || '永久';
-        return '<tr><td>' + ts + '</td><td class="ip">' + r.ip + '</td><td>' + (r.location || '未知') + '</td><td>' + remaining + '</td></tr>';
+        var remaining = escapeHtml(r.remaining || '永久');
+        return '<tr><td>' + ts + '</td><td class="ip">' + escapeHtml(r.ip) + '</td><td>' + (escapeHtml(r.location) || '未知') + '</td><td>' + remaining + '</td></tr>';
       }).join('');
       body.innerHTML = '<table class="bb-table"><thead><tr><th>时间</th><th>违规 IP</th><th>归属地</th><th>剩余封禁</th></tr></thead><tbody>' +
         rowsHtml + '</tbody></table>' +
@@ -2044,19 +2305,25 @@ function closeAdPop() {
 }
 
 /** 弹窗广告：展示（有广告且本次会话未关闭） */
-function showAdPop(ads) {
+function showAdPop(ads, title, sub) {
   try { if (sessionStorage.getItem('pdd_ad_closed')) return; } catch(e) {}
+  var head = document.getElementById('adPopHead');
+  if (title || sub) {
+    document.getElementById('adPopTitle').textContent = title || '';
+    document.getElementById('adPopSub').textContent = sub || '';
+    head.style.display = 'block';
+  } else {
+    head.style.display = 'none';
+  }
   var links = document.getElementById('adPopLinks');
-  var icons = ['#4a9eff', '#ff9500', '#2a71d0', '#0f95d0'];
-  var initials = ['团', '淘', '京', '滴'];
+  var colors = ['#4a9eff', '#ff9500', '#2a71d0', '#0f95d0'];
   links.innerHTML = ads.map(function(ad, i) {
-    var href = ad.link_url || 'javascript:void(0)';
-    var target = ad.link_url ? 'target="_blank" rel="noopener"' : '';
-    var ic = i < 4 ? initials[i] : '荐';
-    var bg = icons[i % icons.length];
+    var href = safeHref(ad.link_url);
+    var target = (href !== 'javascript:void(0)') ? 'target="_blank" rel="noopener"' : '';
+    var bg = colors[i % colors.length];
     return '<a class="ad-link" href="' + href + '" ' + target + '>' +
-      '<span class="ad-icon" style="background:' + bg + '">' + ic + '</span>' +
-      '<span class="txt">' + (ad.title || '点击查看') + '</span>' +
+      '<span class="ad-icon" style="background:' + bg + '">' + (i + 1) + '</span>' +
+      '<span class="txt">点击查看</span>' +
     '</a>';
   }).join('');
   document.getElementById('adPop').classList.add('show');
@@ -2094,26 +2361,19 @@ async function loadConfig() {
       noticeBar.style.display = 'none';
     }
 
-    // 活动入口图片（如果后台配置）
-    if (cfg.entry_image) {
-      var img = document.getElementById('entryImg');
-      img.src = cfg.entry_image;
-      img.style.display = 'block';
-    }
-
     // 广告：弹窗（可关闭）+ 静态位（无广告都不显示）
     var adSection = document.getElementById('adSection');
     if (cfg.ads && cfg.ads.length > 0) {
       adSection.innerHTML = cfg.ads.map(function(ad) {
-        var href = ad.link_url ? ad.link_url : 'javascript:void(0)';
-        var target = ad.link_url ? 'target="_blank" rel="noopener"' : '';
+        var href = safeHref(ad.link_url);
+        var target = (href !== 'javascript:void(0)') ? 'target="_blank" rel="noopener"' : '';
         return '<a class="ad-banner" href="' + href + '" ' + target + '>' +
-          '<img src="' + ad.image_url + '" alt="广告" loading="lazy">' +
+          '<img src="' + escapeHtml(ad.image_url) + '" alt="广告" loading="lazy">' +
         '</a>';
       }).join('');
       adSection.style.display = 'block';
       // 弹窗广告（延迟1.2秒展示，不打扰首次加载）
-      setTimeout(function() { showAdPop(cfg.ads); }, 1200);
+      setTimeout(function() { showAdPop(cfg.ads, cfg.ad_title, cfg.ad_sub); }, 1200);
     } else {
       adSection.innerHTML = '';
       adSection.style.display = 'none';
@@ -2277,6 +2537,15 @@ tr:hover{background:#fafafa}
       <div id="adsContainer"></div>
       <button class="add-ad-btn" onclick="addAdRow()">+ 添加广告</button>
       <div class="hint" style="margin-top:8px">广告显示在提交框上方；不添加任何广告则首页不显示广告位。图片地址支持 http/https。</div>
+      <div class="form-group" style="margin-top:14px">
+        <label>弹窗广告标题</label>
+        <input type="text" id="adTitleInput" placeholder="留空则弹窗不显示标题栏">
+      </div>
+      <div class="form-group">
+        <label>弹窗广告副标题</label>
+        <input type="text" id="adSubInput" placeholder="留空则弹窗不显示标题栏">
+      </div>
+      <div class="hint">弹窗广告仅在配置了至少一条广告时出现；标题与副标题两者都留空则只显示广告链接列表。</div>
     </div>
     <div class="card">
       <h3>联系与智能功能</h3>
@@ -2393,18 +2662,11 @@ tr:hover{background:#fafafa}
 var adminKey = '';
 var codesPage = 1, logsPage = 1, reportsPage = 1;
 
-/** 格式化后台剩余时间 */
-function formatRemainingAdmin(expiresAt) {
-  if (!expiresAt) return '永久';
-  var diff = new Date(expiresAt).getTime() - Date.now();
-  if (diff <= 0) return '已过期';
-  var hours = Math.floor(diff / (3600 * 1000));
-  if (hours < 24) return hours + '小时后';
-  var days = Math.floor(hours / 24);
-  if (days < 30) return days + '天后';
-  var months = Math.floor(days / 30);
-  if (months < 12) return months + '个月后';
-  return Math.floor(months / 12) + '年后';
+/** HTML 转义：管理后台所有动态值（归属地/原因/码等）拼 innerHTML 前先转义 */
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+    return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+  });
 }
 
 /** IP脱敏（前端版，兼容IPv4/IPv6） */
@@ -2464,9 +2726,10 @@ var adSeq = 0;
 
 function adRowHTML(image_url, link_url) {
   adSeq++;
+  // value 必须转义：广告 URL 来自 settings，若历史脏数据含引号会截断属性造成注入
   return '<div class="ad-row" id="adRow-' + adSeq + '">' +
-    '<input type="text" class="ad-img" placeholder="广告图片URL (必填)" value="' + (image_url || '') + '">' +
-    '<input type="text" class="ad-link" placeholder="跳转链接URL (可选)" value="' + (link_url || '') + '" style="flex:0.8">' +
+    '<input type="text" class="ad-img" placeholder="广告图片URL (必填)" value="' + escapeHtml(image_url || '') + '">' +
+    '<input type="text" class="ad-link" placeholder="跳转链接URL (可选)" value="' + escapeHtml(link_url || '') + '" style="flex:0.8">' +
     '<button class="rm-btn" onclick="removeAdRow(\\'adRow-' + adSeq + '\\')">删除</button>' +
   '</div>';
 }
@@ -2477,11 +2740,13 @@ function loadSettings() {
     document.getElementById('noticeInput').value = data.data.notice || '';
     document.getElementById('qqGroupInput').value = data.data.qq_group || '';
     document.getElementById('qqOwnerInput').value = data.data.qq_owner || '';
-    document.getElementById('smartEnabledInput').value = data.data.smart_enabled === 'off' ? 'off' : 'on';
+    document.getElementById('smartEnabledInput').value = data.data.smart_enabled === false ? 'off' : 'on';
     document.getElementById('refreshIntervalInput').value = data.data.refresh_interval || '5';
     document.getElementById('rateLimitMaxInput').value = data.data.rate_limit_max || '5';
     document.getElementById('dailyLimitInput').value = data.data.daily_limit || '30';
     document.getElementById('ocrModeInput').value = (data.data.ocr_mode === 'ai') ? 'ai' : 'local';
+    document.getElementById('adTitleInput').value = data.data.ad_title || '';
+    document.getElementById('adSubInput').value = data.data.ad_sub || '';
     var ads = data.data.ads || [];
     var container = document.getElementById('adsContainer');
     container.innerHTML = '';
@@ -2514,6 +2779,8 @@ function saveSettings() {
   var rateLimitMax = document.getElementById('rateLimitMaxInput').value;
   var dailyLimit = document.getElementById('dailyLimitInput').value;
   var ocrMode = document.getElementById('ocrModeInput').value;
+  var adTitle = document.getElementById('adTitleInput').value;
+  var adSub = document.getElementById('adSubInput').value;
   var ads = [];
   document.querySelectorAll('#adsContainer .ad-row').forEach(function(row) {
     var img = row.querySelector('.ad-img').value.trim();
@@ -2524,7 +2791,7 @@ function saveSettings() {
   api('/api/admin/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ notice: notice, ads: ads, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartEnabled, refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit, ocr_mode: ocrMode })
+    body: JSON.stringify({ notice: notice, ads: ads, ad_title: adTitle, ad_sub: adSub, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartEnabled, refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit, ocr_mode: ocrMode })
   }).then(function(data) {
     if (data.success) {
       alert('设置已保存');
@@ -2555,9 +2822,9 @@ function loadCodes(page) {
       tbody.innerHTML = data.data.map(function(c) {
         var time = new Date(c.created_at).toLocaleString('zh-CN');
         var statusColor = c.status === 'active' ? '#07c160' : c.status === 'used' ? '#f39c12' : '#999';
-        return '<tr><td>' + c.id + '</td><td class="mono">' + c.code + '</td><td class="mono">' + c.ip + '</td>' +
-          '<td style="font-size:12px;color:#666">' + (c.location || '-') + '</td>' +
-          '<td style="color:' + statusColor + '">' + c.status + '</td><td>' + time + '</td>' +
+        return '<tr><td>' + c.id + '</td><td class="mono">' + escapeHtml(c.code) + '</td><td class="mono">' + escapeHtml(c.ip) + '</td>' +
+          '<td style="font-size:12px;color:#666">' + (escapeHtml(c.location) || '-') + '</td>' +
+          '<td style="color:' + statusColor + '">' + escapeHtml(c.status) + '</td><td>' + time + '</td>' +
           '<td><button class="btn-sm btn-danger" onclick="deleteCode(' + c.id + ')">删除</button></td></tr>';
       }).join('');
       renderPageNav('codesPageNav', data.pagination, loadCodes);
@@ -2583,11 +2850,12 @@ function loadBlacklist() {
       var durMap = { '24h': '24小时', '1m': '1个月', '1y': '1年', permanent: '永久' };
       tbody.innerHTML = data.data.map(function(b) {
         var time = new Date(b.created_at).toLocaleString('zh-CN');
-        var remaining = b.expires_at ? formatRemainingAdmin(b.expires_at) : (b.duration === 'permanent' ? '永久' : '');
-        var durLabel = durMap[b.duration] || b.duration || '-';
-        var durHtml = remaining ? durLabel + '<br><span style="color:#e53935;font-size:11px">' + remaining + '</span>' : durLabel;
-        return '<tr><td class="mono">' + b.ip + '</td><td>' + (b.location || '-') + '</td><td>' + (b.reason || '-') + '</td><td>' + durHtml + '</td><td>' + time + '</td>' +
-          '<td><button class="btn-sm btn-success" onclick="removeBlacklist(\\'' + b.ip + '\\')">移除</button></td></tr>';
+        // remaining 由后端统一计算（与公示页同一套逻辑），前端不再重复实现
+        var remaining = b.remaining || '';
+        var durLabel = durMap[b.duration] || escapeHtml(b.duration) || '-';
+        var durHtml = remaining ? durLabel + '<br><span style="color:#e53935;font-size:11px">' + escapeHtml(remaining) + '</span>' : durLabel;
+        return '<tr><td class="mono">' + escapeHtml(b.ip) + '</td><td>' + (escapeHtml(b.location) || '-') + '</td><td>' + (escapeHtml(b.reason) || '-') + '</td><td>' + durHtml + '</td><td>' + time + '</td>' +
+          '<td><button class="btn-sm btn-success" data-ip="' + escapeHtml(b.ip) + '" onclick="removeBlacklist(this.dataset.ip)">移除</button></td></tr>';
       }).join('');
     }
   });
@@ -2643,9 +2911,9 @@ function loadReports(page) {
           actions += '<button class="btn-sm" style="background:#f39c12" onclick="updateReport(' + r.id + ',\\'pending\\')">恢复待处理</button> ';
         }
         actions += '<button class="btn-sm btn-danger" onclick="deleteReport(' + r.id + ')">删除</button>';
-        return '<tr><td>' + r.id + '</td><td class="mono">' + (r.code || '-') + '</td><td class="mono">' + r.ip + '</td>' +
-          '<td class="mono">' + submitterIP + '</td>' +
-          '<td style="color:' + st[1] + '">' + st[0] + '</td><td>' + time + '</td><td>' + actions + '</td></tr>';
+        return '<tr><td>' + r.id + '</td><td class="mono">' + (escapeHtml(r.code) || '-') + '</td><td class="mono">' + escapeHtml(r.ip) + '</td>' +
+          '<td class="mono">' + escapeHtml(submitterIP) + '</td>' +
+          '<td style="color:' + st[1] + '">' + escapeHtml(st[0]) + '</td><td>' + time + '</td><td>' + actions + '</td></tr>';
       }).join('');
       renderPageNav('reportsPageNav', data.pagination, loadReports);
     }
@@ -2678,8 +2946,8 @@ function loadLogs(page) {
       tbody.innerHTML = data.data.map(function(l) {
         var time = new Date(l.created_at).toLocaleString('zh-CN');
         var actionColor = { submit: '#07c160', blocked: '#e53935', use: '#2a71d0' }[l.action] || '#333';
-        return '<tr><td class="mono">' + l.ip + '</td><td class="mono">' + (l.code || '-') + '</td>' +
-          '<td style="color:' + actionColor + '">' + l.action + '</td><td>' + (l.reason || '-') + '</td><td>' + time + '</td></tr>';
+        return '<tr><td class="mono">' + escapeHtml(l.ip) + '</td><td class="mono">' + (escapeHtml(l.code) || '-') + '</td>' +
+          '<td style="color:' + actionColor + '">' + escapeHtml(l.action) + '</td><td>' + (escapeHtml(l.reason) || '-') + '</td><td>' + time + '</td></tr>';
       }).join('');
       renderPageNav('logsPageNav', data.pagination, loadLogs);
     }

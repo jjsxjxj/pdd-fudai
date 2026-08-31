@@ -17,3 +17,9 @@ node_modules/
 
 # 真实部署配置含私有 ID，只提交 wrangler.toml.example 模板
 wrangler.toml
+
+# 本地开发密钥（ADMIN_KEY 等），绝不入库
+.dev.vars
+.dev.vars.*
+.env
+.env.*

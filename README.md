@@ -50,7 +50,8 @@
 ### 联系与广告
 - 首页"建议·反馈·申诉"弹窗：QQ 群一键加群 + 站长 QQ（后台可配置，留空自动隐藏）
 - 广告位：静态广告条 + 可关闭的弹窗广告，显示在提交框上方
-- 无广告时全部自动隐藏
+- 弹窗广告的标题/副标题由后台配置（留空则不渲染标题栏），项目内不含任何硬编码的第三方品牌文案
+- 无广告时全部自动隐藏，`/api/config` 也不返回 `ads` / `ad_title` / `ad_sub` 字段
 
 ### 识图提取（OCR 自动识别互助码）
 - 首页上传/截图福袋分享图，一键识别 8-9 位互助码，免去手动输入
@@ -64,16 +65,30 @@
 - 同步先用 Cloudflare `request.cf` 数据兜底展示（英文归属地，零耗时）
 - 中文归属地（百度 API）通过 `ctx.waitUntil` 在后台异步补全，几秒内自动更新
 
-### 防恶意提交（5 层防护）
+### 安全防护
+写接口统一在 API 入口做黑名单拦截（`/api/submit`、`/api/quick-use`、`/api/use/:id`、`/api/report/:id`、`/api/ocr`），命中直接 403。
+
+提交链路的 5 层防护：
 1. **IP 黑名单检查** - 命中黑名单直接拒绝
 2. **速率限制** - 单 IP 每分钟最多提交 5 次
-3. **每日限额** - 单 IP 每天最多提交 30 次
-4. **蜜罐字段** - 隐藏字段检测机器人提交
+3. **每日限额** - 单 IP 每天最多提交 30 次（按 CST 自然日）
+4. **蜜罐字段** - 隐藏字段检测机器人提交（返回假成功，不入库）
 5. **输入校验** - 严格校验 8-9 位纯数字格式
+
+其他接口与全局加固：
+- **访问打点限流** - `/api/visit` 单 IP 每分钟最多 30 次
+- **后台鉴权失败限流** - 单 IP 每分钟 10 次失败后转 429，失败均记入审计日志
+- **密钥恒时比较** - SHA-256 摘要定长比较，不泄露密钥长度
+- **举报防武器化** - 禁止自举报、24 小时时间窗、需 3 个不同 IP 才自动拉黑
+- **并发安全** - 领码走原子 UPDATE + `meta.changes` 判定，不存在超发
+- **分页收敛** - `pageSize` 上限 200，`page` 最小 1
+- **请求体闸门** - `content-length` 超 8MB 直接 413
+- **响应缓存策略** - 含互助码的 JSON 一律 `no-store`；`/admin` 额外带 `X-Robots-Tag: noindex`
+- **安全响应头** - CSP、`X-Frame-Options: DENY`、`nosniff`、`no-referrer`
 
 ### 管理后台
 - 数据统计面板（活跃码、已使用、黑名单数、今日提交/拦截、待处理举报）
-- 站点设置（公告、广告位、QQ 群/站长 QQ、智能直达开关、刷新间隔）
+- 站点设置（公告、广告位、弹窗广告文案、QQ 群/站长 QQ、智能直达开关、刷新间隔、OCR 模式、限流阈值）
 - 邀请码管理（查看完整码、归属地、删除）
 - IP 黑名单管理（添加/移除，支持归属地 + 封禁期限 + 剩余时间显示）
 - 举报管理（处理/驳回/删除，显示提交者 IP 脱敏）
@@ -172,6 +187,12 @@ wrangler deploy
 | `DAILY_LIMIT` | 30 | 每 IP 每日最大提交次数 |
 | `CODE_TTL_HOURS` | 24 | 邀请码过期时间（小时） |
 | `USED_KEEP_MS` | 30000 | 使用后保留时长（毫秒） |
+| `VISIT_RATE_LIMIT` | 30 | 每 IP 每分钟访问打点上限 |
+| `ADMIN_FAIL_LIMIT` | 10 | 每 IP 每分钟后台鉴权失败上限（超出转 429） |
+| `REPORT_AUTO_BAN_THRESHOLD` | 3 | 自动拉黑所需的不同举报人 IP 数 |
+| `REPORT_AUTO_BAN_WINDOW_MS` | 86400000 | 举报计票时间窗（24 小时） |
+| `LOG_KEEP_DAYS` | 30 | 日志/访问/已处理举报保留天数（Cron 清理） |
+| `PAGE_SIZE_MAX` | 200 | 分页接口 `pageSize` 上限 |
 
 ### Wrangler 配置（`wrangler.toml`，从 `wrangler.toml.example` 复制）
 
@@ -196,18 +217,19 @@ wrangler deploy
 | POST | `/api/ocr` | AI 识图提取互助码（限流，本地识别失败时兜底） |
 | POST | `/api/use/:id` | 标记已使用，返回完整码 |
 | POST | `/api/quick-use` | 智能直达 |
-| GET | `/api/blacklist` | 公共黑名单公示 |
-| POST | `/api/report/:id` | 举报假码 |
+| GET | `/api/blacklist` | 公共黑名单公示（分页，`pageSize` 上限 200；自动排除已过期记录） |
+| POST | `/api/report/:id` | 举报假码（禁止自举报，24h 内 3 个不同 IP 触发自动拉黑） |
+| GET | `/robots.txt` | 禁止收录 `/admin` 与 `/api/` |
 
 ### 管理接口（需 `X-Admin-Key` 头）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/admin/stats` | 统计数据 |
-| GET/POST | `/api/admin/settings` | 站点设置 |
+| GET/POST | `/api/admin/settings` | 站点设置（`notice` / `ads` / `ad_title` / `ad_sub` / `qq_group` / `qq_owner` / `smart_enabled` / `refresh_interval` / `rate_limit_max` / `daily_limit` / `ocr_mode`） |
 | GET | `/api/admin/codes` | 所有邀请码（含完整码） |
 | DELETE | `/api/admin/codes/:id` | 删除指定码 |
-| GET/POST/DELETE | `/api/admin/blacklist` | 黑名单管理 |
+| GET/POST/DELETE | `/api/admin/blacklist` | 黑名单管理（GET 响应含服务端计算的 `remaining` 剩余时长） |
 | GET | `/api/admin/reports` | 举报列表 |
 | POST | `/api/admin/reports/:id/status` | 更新举报状态 |
 | DELETE | `/api/admin/reports/:id` | 删除举报 |
