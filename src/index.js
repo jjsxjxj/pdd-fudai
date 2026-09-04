@@ -29,6 +29,9 @@ const CONFIG = {
   LOG_KEEP_DAYS: 30,           // submit_logs / visits / reports 保留天数
   PAGE_SIZE_MAX: 200,          // 后台分页每页最大条数
   PAGE_MAX: 100000,            // 后台分页最大页码（防 offset 溢出成非安全整数）
+  // iOS 快捷指令默认地址：后台「站点设置」未配置过 ios_url 时首页用这个；
+  // 后台显式保存为空则首页不显示该按钮（区分「未配置」与「配置为空」两种语义）
+  IOS_SHORTCUT_URL: 'https://www.icloud.com/shortcuts/e5dacaf5c4dc4809bca41848175373c1',
 };
 
 /** 需要黑名单拦截的公开写接口（被拉黑的 IP 不仅不能提交，也不能领码/举报/刷 AI 额度） */
@@ -238,6 +241,18 @@ function sanitizeUrl(u) {
   return t;
 }
 
+/** iOS 快捷指令地址的三态解析（settings 里 ios_url 有三种状态，语义各不相同）：
+ *   ① DB 无该行（从未在后台保存过）→ 用 CONFIG.IOS_SHORTCUT_URL 默认值
+ *   ② 后台显式保存为空       → 返回 ''，首页据此隐藏按钮（这是「主动关掉」，不能回退成默认值）
+ *   ③ 有值                   → 再过一遍 sanitizeUrl，防历史脏数据绕过保存时的校验；
+ *                              校验不通过按「隐藏」处理（fail closed，比悄悄退回默认值可预期）*/
+function resolveIosUrl(raw) {
+  if (raw === undefined || raw === null) return CONFIG.IOS_SHORTCUT_URL;
+  const t = String(raw).trim();
+  if (!t) return '';
+  return sanitizeUrl(t);
+}
+
 /** 安全读取 JSON 请求体
  *  原来 4 个处理器各自复制一份 try/catch，且都假定解析结果是对象：
  *  body 为 `null` / `"str"` / `123`（都是合法 JSON）时，后续 body.xxx 会抛 TypeError
@@ -256,7 +271,7 @@ async function readJsonBody(request) {
  *  这是首页每次加载都会打的接口，原来 7 次 getSetting + 3 次统计 = 10 个串行 D1 往返；
  *  现在压到 1 次 settings 批量读 + 1 次三指标合并统计。 */
 async function handleGetConfig(db) {
-  const s = await getSettings(db, ['notice', 'ads', 'ad_title', 'ad_sub', 'qq_group', 'qq_owner', 'smart_enabled', 'refresh_interval', 'ocr_mode']);
+  const s = await getSettings(db, ['notice', 'ads', 'ad_title', 'ad_sub', 'qq_group', 'qq_owner', 'smart_enabled', 'refresh_interval', 'ocr_mode', 'ios_url']);
   const notice = s.notice;
   const adsRaw = s.ads;
   const qqGroup = s.qq_group;
@@ -304,6 +319,9 @@ async function handleGetConfig(db) {
 
   // OCR 模式：local（默认，浏览器本地优先）/ ai（仅服务端 AI），默认 local
   data.ocr_mode = (s.ocr_mode === 'ai') ? 'ai' : 'local';
+
+  // iOS 快捷指令地址：从未配置过 → 用服务端默认值；后台显式留空 → 返回 ''，前端隐藏按钮
+  data.ios_url = resolveIosUrl(s.ios_url);
 
   // 今日统计（按中国时区 CST UTC+8 算今日 0:00，与前端列表展示日期一致）
   // 三个指标合并成一条查询，比原来 3 次串行往返快得多
@@ -958,11 +976,15 @@ async function handleAdminDeleteCode(db, id) {
 
 /** GET /api/admin/settings — 读取站点设置 */
 async function handleAdminGetSettings(db) {
-  const s = await getSettings(db, ['notice', 'ads', 'ad_title', 'ad_sub', 'qq_group', 'qq_owner', 'smart_enabled', 'refresh_interval', 'rate_limit_max', 'daily_limit', 'ocr_mode']);
+  const s = await getSettings(db, ['notice', 'ads', 'ad_title', 'ad_sub', 'qq_group', 'qq_owner', 'smart_enabled', 'refresh_interval', 'rate_limit_max', 'daily_limit', 'ocr_mode', 'ios_url']);
   const notice = s.notice || '';
   const adsRaw = s.ads || '[]';
   const adTitle = s.ad_title || '';
   const adSub = s.ad_sub || '';
+  // iOS 地址对后台回填要做区分：从未配置过 → 把服务端默认值显示出来（让管理员看到当前生效的是哪个）；
+  // 显式保存为空 → 老老实实显示空，代表「已主动关闭」。这里不能直接用 resolveIosUrl，
+  // 否则两者都变成同一个值，管理员无法分辨。
+  const iosUrl = (s.ios_url === undefined || s.ios_url === null) ? CONFIG.IOS_SHORTCUT_URL : s.ios_url;
   const qqGroup = s.qq_group || '';
   const qqOwner = s.qq_owner || '';
   const smartRaw = s.smart_enabled || 'on';
@@ -977,7 +999,7 @@ async function handleAdminGetSettings(db) {
   } catch {
     ads = [];
   }
-  return json({ success: true, data: { notice, ads, ad_title: adTitle, ad_sub: adSub, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartRaw !== 'off', refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit, ocr_mode: ocrMode } });
+  return json({ success: true, data: { notice, ads, ad_title: adTitle, ad_sub: adSub, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartRaw !== 'off', refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit, ocr_mode: ocrMode, ios_url: iosUrl } });
 }
 
 /** POST /api/admin/settings — 保存站点设置
@@ -1009,6 +1031,20 @@ async function handleAdminSaveSettings(db, request) {
   // 弹窗广告文案：留空则首页弹窗不显示标题栏
   if (typeof body.ad_title === 'string') pending.ad_title = body.ad_title.trim().slice(0, 60);
   if (typeof body.ad_sub === 'string') pending.ad_sub = body.ad_sub.trim().slice(0, 120);
+
+  // iOS 快捷指令地址：留空 = 首页隐藏该按钮；非空必须过协议白名单（防 javascript: 伪协议）
+  // 这里选择「报错」而不是像广告 URL 那样静默清空：管理员少写协议头（如 icloud.com/...）时，
+  // 静默清空会让按钮凭空消失且不留任何痕迹，报错能当场说清原因。
+  if (typeof body.ios_url === 'string') {
+    const raw = body.ios_url.trim().slice(0, 500);
+    if (!raw) {
+      pending.ios_url = '';
+    } else if (!sanitizeUrl(raw)) {
+      return json({ success: false, error: 'iOS 快捷指令地址必须以 http:// 或 https:// 开头' }, 400);
+    } else {
+      pending.ios_url = sanitizeUrl(raw);
+    }
+  }
 
   // 联系方式
   if (typeof body.qq_group === 'string') pending.qq_group = body.qq_group.trim().slice(0, 50);
@@ -1653,7 +1689,9 @@ summary{font-size:14px}
 
     <button class="feedback-btn" onclick="openContact()">💬 建议 · 反馈 · 申诉 · 加入组织</button>
     <button class="feedback-btn feedback-btn-red" onclick="openBlacklist()">🚫 违规小黑屋公示 (严打乱拉人)</button>
-    <a class="feedback-btn feedback-btn-ios" href="https://www.icloud.com/shortcuts/e5dacaf5c4dc4809bca41848175373c1" target="_blank" rel="noopener">📱 <span>iOS 快捷指令版</span><span class="ios-tag">一键安装</span></a>
+    <!-- iOS 快捷指令：地址由后台「站点设置」配置。未配置过 → 用服务端默认地址；后台显式留空 → 隐藏此按钮。
+         链接不写死在模板里，改地址不必重新部署。 -->
+    <a class="feedback-btn feedback-btn-ios" id="iosShortcutBtn" style="display:none" target="_blank" rel="noopener">📱 <span>iOS 快捷指令版</span><span class="ios-tag">一键安装</span></a>
 
     <details>
       <summary>展开查看详细说明</summary>
@@ -1763,11 +1801,16 @@ function escapeHtml(s) {
   });
 }
 
+/** 是否 http(s) 链接。协议判定只留这一份，避免两处判断逻辑漂移。 */
+function isHttpUrl(u) {
+  var s = String(u || '').trim();
+  return s.indexOf('http://') === 0 || s.indexOf('https://') === 0;
+}
+
 /** 链接协议白名单：只允许 http/https，拒绝 javascript:/data: 等（配合后端 sanitizeUrl 双保险） */
 function safeHref(u) {
   var s = String(u || '').trim();
-  if (s.indexOf('http://') === 0 || s.indexOf('https://') === 0) return escapeHtml(s);
-  return 'javascript:void(0)';
+  return isHttpUrl(s) ? escapeHtml(s) : 'javascript:void(0)';
 }
 
 async function submitCode() {
@@ -2387,6 +2430,17 @@ async function loadConfig() {
       document.getElementById('smartBtn').style.display = 'none';
     }
 
+    // iOS 快捷指令按钮：地址来自后台配置，留空则隐藏按钮
+    // 赋值给 DOM 属性要用原始值（safeHref 是给 HTML 拼接用的，会转义）；
+    // 协议再判一次，防止 href 被设成 javascript: 伪协议
+    var iosBtn = document.getElementById('iosShortcutBtn');
+    if (cfg.ios_url && isHttpUrl(cfg.ios_url)) {
+      iosBtn.href = String(cfg.ios_url);
+      iosBtn.style.display = '';   // 清空内联样式，回落到 CSS 里的默认 display
+    } else {
+      iosBtn.style.display = 'none';
+    }
+
     // OCR 模式：存全局，识图时决定用 AI 还是浏览器本地
     window._ocrMode = (cfg.ocr_mode === 'ai') ? 'ai' : 'local';
   } catch(e) {
@@ -2564,6 +2618,11 @@ tr:hover{background:#fafafa}
           <option value="off">关闭</option>
         </select>
         <div class="hint">开启后首页一键取最新互助码并直接跳转拼多多。</div>
+      </div>
+      <div class="form-group">
+        <label>iOS 快捷指令地址</label>
+        <input type="text" id="iosUrlInput" placeholder="留空则首页隐藏「iOS 快捷指令版」按钮">
+        <div class="hint">首页「📱 iOS 快捷指令版」按钮的跳转地址，须以 http:// 或 https:// 开头；留空则首页不显示该按钮。</div>
       </div>
       <div class="form-group">
         <label>列表刷新间隔（秒）</label>
@@ -2747,6 +2806,7 @@ function loadSettings() {
     document.getElementById('ocrModeInput').value = (data.data.ocr_mode === 'ai') ? 'ai' : 'local';
     document.getElementById('adTitleInput').value = data.data.ad_title || '';
     document.getElementById('adSubInput').value = data.data.ad_sub || '';
+    document.getElementById('iosUrlInput').value = data.data.ios_url || '';
     var ads = data.data.ads || [];
     var container = document.getElementById('adsContainer');
     container.innerHTML = '';
@@ -2781,6 +2841,7 @@ function saveSettings() {
   var ocrMode = document.getElementById('ocrModeInput').value;
   var adTitle = document.getElementById('adTitleInput').value;
   var adSub = document.getElementById('adSubInput').value;
+  var iosUrl = document.getElementById('iosUrlInput').value;
   var ads = [];
   document.querySelectorAll('#adsContainer .ad-row').forEach(function(row) {
     var img = row.querySelector('.ad-img').value.trim();
@@ -2791,7 +2852,7 @@ function saveSettings() {
   api('/api/admin/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ notice: notice, ads: ads, ad_title: adTitle, ad_sub: adSub, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartEnabled, refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit, ocr_mode: ocrMode })
+    body: JSON.stringify({ notice: notice, ads: ads, ad_title: adTitle, ad_sub: adSub, qq_group: qqGroup, qq_owner: qqOwner, smart_enabled: smartEnabled, refresh_interval: refreshInterval, rate_limit_max: rateLimitMax, daily_limit: dailyLimit, ocr_mode: ocrMode, ios_url: iosUrl })
   }).then(function(data) {
     if (data.success) {
       alert('设置已保存');

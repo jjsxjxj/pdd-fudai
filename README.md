@@ -88,7 +88,7 @@
 
 ### 管理后台
 - 数据统计面板（活跃码、已使用、黑名单数、今日提交/拦截、待处理举报）
-- 站点设置（公告、广告位、弹窗广告文案、QQ 群/站长 QQ、智能直达开关、刷新间隔、OCR 模式、限流阈值）
+- 站点设置（公告、广告位、弹窗广告文案、QQ 群/站长 QQ、智能直达开关、iOS 快捷指令地址、刷新间隔、OCR 模式、限流阈值）
 - 邀请码管理（查看完整码、归属地、删除）
 - IP 黑名单管理（添加/移除，支持归属地 + 封禁期限 + 剩余时间显示）
 - 举报管理（处理/驳回/删除，显示提交者 IP 脱敏）
@@ -226,7 +226,7 @@ wrangler deploy
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/admin/stats` | 统计数据 |
-| GET/POST | `/api/admin/settings` | 站点设置（`notice` / `ads` / `ad_title` / `ad_sub` / `qq_group` / `qq_owner` / `smart_enabled` / `refresh_interval` / `rate_limit_max` / `daily_limit` / `ocr_mode`） |
+| GET/POST | `/api/admin/settings` | 站点设置（`notice` / `ads` / `ad_title` / `ad_sub` / `qq_group` / `qq_owner` / `smart_enabled` / `refresh_interval` / `rate_limit_max` / `daily_limit` / `ocr_mode` / `ios_url`） |
 | GET | `/api/admin/codes` | 所有邀请码（含完整码） |
 | DELETE | `/api/admin/codes/:id` | 删除指定码 |
 | GET/POST/DELETE | `/api/admin/blacklist` | 黑名单管理（GET 响应含服务端计算的 `remaining` 剩余时长） |
