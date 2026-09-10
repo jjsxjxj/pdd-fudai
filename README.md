@@ -119,25 +119,39 @@
 
 ## 部署步骤
 
-### 1. 安装 Wrangler CLI
+本项目提供两套部署教程，按自己的情况任选其一：
+
+| 方式 | 是否需要命令行 | 需要装软件 | OCR 识图 | 详细教程 |
+|------|--------------|-----------|---------|---------|
+| **A. 命令行部署（推荐）** | 需要 | Node.js + Wrangler | ✅ 本地识别 + AI 兜底 | 本文下方步骤 / [DEPLOY.md](DEPLOY.md)（手把手详解） |
+| **B. 纯网页部署** | 不需要 | 无，全程浏览器 | ⚠️ 仅 AI 识别（需绑定 Workers AI） | [DEPLOY-WEB.md](DEPLOY-WEB.md) |
+
+> **两种方式唯一的差别在 OCR 识图**：OCR 的「本地识别」依赖 tesseract.js 运行时与模型（约 20MB，在 `public/ocr/`），必须随 Worker Assets 一并上传，而 Cloudflare 的网页编辑器只能保存单个代码文件，无法上传这批资源。所以网页版只能走「AI 识别」路径——按网页版教程第 6 步绑定 Workers AI 即可正常识图。其余功能两种方式完全一致。
+
+以下为 **方式 A：命令行部署** 的完整步骤。
+
+### 1. 克隆项目
+
+```bash
+git clone https://github.com/jjsxjxj/pdd-fudai.git
+cd pdd-fudai
+```
+
+> 没装 Git？从 https://git-scm.com/downloads 下载安装，或在 GitHub 页面点 **Code → Download ZIP** 下载解压。
+
+### 2. 安装 Wrangler CLI
+
+> 需要 **Node.js 22 或更高**（最新版 Wrangler 的硬性要求，低于 22 会报 `EBADENGINE`）。
 
 ```bash
 npm install -g wrangler
 ```
 
-### 2. 登录 Cloudflare
+### 3. 登录 Cloudflare
 
 ```bash
 wrangler login
 ```
-
-### 3. 复制配置模板
-
-```bash
-cp wrangler.toml.example wrangler.toml
-```
-
-仓库中的 `wrangler.toml.example` 是脱敏模板；真实的 `wrangler.toml`（含你的 ID）已加入 `.gitignore`，不会被提交。
 
 ### 4. 创建 D1 数据库
 
@@ -145,21 +159,23 @@ cp wrangler.toml.example wrangler.toml
 wrangler d1 create pdd-fudai-db
 ```
 
-将输出的 `database_id` 填入 `wrangler.toml`。
+记下输出中的 `database_id`（一串 UUID），下一步要填进配置文件。
 
-### 5. 初始化数据库
+### 5. 复制配置模板
+
+```bash
+cp wrangler.toml.example wrangler.toml
+```
+
+把上一步的 `database_id` 填入 `wrangler.toml` 的 `d1_databases` 段。
+
+仓库中的 `wrangler.toml.example` 是脱敏模板；真实的 `wrangler.toml`（含你的 ID）已加入 `.gitignore`，不会被提交。
+
+### 6. 初始化数据库
 
 ```bash
 wrangler d1 execute pdd-fudai-db --remote --file=schema.sql
 ```
-
-### 6. 设置管理密钥
-
-```bash
-wrangler secret put ADMIN_KEY
-```
-
-> ADMIN_KEY 是管理后台的登录密码，务必设置复杂一些，且**不要**写进任何文件。
 
 ### 7. 部署
 
@@ -169,7 +185,17 @@ wrangler deploy
 
 `public/ocr/` 下的 OCR 运行时（约 20MB）会随 Worker Assets 一并部署到同域 `/ocr/`。
 
-### 8. 绑定自定义域名（可选）
+### 8. 设置管理密钥
+
+```bash
+wrangler secret put ADMIN_KEY
+```
+
+> ADMIN_KEY 是管理后台的登录密码，务必设置复杂一些，且**不要**写进任何文件。
+>
+> **此步必须在部署之后执行**：`wrangler secret put` 要求目标 Worker 已经存在，未部署时会报 `script_not_found [code: 10007]`。设置成功即自动生成新版本并上线，无需再执行一次 `deploy`。
+
+### 9. 绑定自定义域名（可选）
 
 在 `wrangler.toml` 中配置 `routes`（替换 pattern 与 zone_id），并在 Cloudflare Dashboard 添加 DNS 记录。详见 [DEPLOY.md](DEPLOY.md)。
 
@@ -247,7 +273,8 @@ pdd-fudai/
 ├── schema.sql                # D1 数据库建表脚本
 ├── wrangler.toml.example     # 部署配置模板（脱敏，复制为 wrangler.toml 使用）
 ├── package.json              # 项目配置
-├── DEPLOY.md                 # 详细部署教程（新手友好）
+├── DEPLOY.md                 # 详细部署教程 · 命令行版（新手友好）
+├── DEPLOY-WEB.md             # 详细部署教程 · 纯网页版（不装任何软件）
 ├── CHANGELOG.md              # 更新日志
 └── README.md                 # 本文档
 ```

@@ -4,6 +4,23 @@
 > 只要会注册账号、会复制粘贴就能部署。
 > 预计耗时：**10~15 分钟**
 
+## ⚠️ 开始之前：先确认这本教程适合你
+
+| | 本教程（纯网页部署） | [命令行部署](DEPLOY.md) |
+|---|---|---|
+| 需要装软件 | 不用 | Node.js + Wrangler |
+| 获取源码 | 从 GitHub 网页复制 | `git clone` |
+| 提交 / 取码 / 举报 / 黑名单 / 后台管理 | ✅ 全部可用 | ✅ 全部可用 |
+| OCR 识图 —— **本地识别** | ❌ 不可用 | ✅ 可用 |
+| OCR 识图 —— **AI 识别** | ✅ 可用（需做第 6 步的 AI 绑定） | ✅ 可用 |
+
+**为什么网页版用不了「本地识别」？**
+OCR 本地识别依赖 tesseract.js 的运行时和模型文件（主库、worker、WASM core、训练数据，合计约 20MB），它们存放在项目的 `public/ocr/` 目录，必须随 Worker 的**静态资源（Assets）**一起上传。而 Cloudflare 的网页代码编辑器只能粘贴和保存**单个代码文件**，无法上传这批二进制资源——缺少它们时，浏览器端的识图脚本加载不到，"本地识别"必然失败。
+
+**好消息**：AI 识别走的是服务端接口（`/api/ocr?force=ai`），把图片直接交给 Cloudflare Workers AI 处理，**不依赖那批前端资源**。只要按第 6 步绑定 Workers AI，识图功能照样能用。
+
+> **建议**：绑定 AI 之后，顺便在后台把「站点设置 → OCR 模式」改成 **AI**，这样点识图会直接走 AI，不必先等一次本地识别失败。不设置也能用——本地识别失败后会弹窗让你选「用 AI 识别」。
+
 ---
 
 ## 目录
@@ -12,8 +29,8 @@
 2. [创建 D1 数据库](#第-2-步创建-d1-数据库)
 3. [建数据库表](#第-3-步建数据库表)
 4. [创建 Worker](#第-4-步创建-worker)
-5. [粘贴代码](#第-5-步粘贴代码)
-6. [绑定数据库](#第-6-步绑定数据库)
+5. [获取代码并粘贴](#第-5-步获取代码并粘贴到编辑器)
+6. [绑定数据库与 AI](#第-6-步绑定数据库与-ai)
 7. [设置管理密码](#第-7-步设置管理密码)
 8. [设置定时清空](#第-8-步设置定时清空)
 9. [部署上线](#第-9-步部署上线)
@@ -61,64 +78,101 @@ D1 是 Cloudflare 的免费数据库，用来存邀请码、黑名单等数据�
 -- 邀请码表
 CREATE TABLE IF NOT EXISTS codes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  code TEXT NOT NULL,
-  code_masked TEXT NOT NULL,
-  ip TEXT NOT NULL,
-  status TEXT DEFAULT 'active',
-  used_at TEXT,
-  created_at TEXT NOT NULL,
-  location TEXT DEFAULT ''
+  code TEXT NOT NULL,              -- 完整邀请码 (8-9位数字)
+  code_masked TEXT NOT NULL,       -- 脱敏后的码 (中间两位隐藏)
+  ip TEXT NOT NULL,                -- 提交者IP
+  status TEXT DEFAULT 'active',    -- active / used
+  used_at TEXT,                    -- 被点击跳转的时间
+  created_at TEXT NOT NULL,        -- 提交时间
+  location TEXT DEFAULT ''         -- 提交者归属地 (如: 嘉兴市 电信)
 );
 
 -- IP 黑名单表
 CREATE TABLE IF NOT EXISTS blacklist (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ip TEXT NOT NULL UNIQUE,
-  reason TEXT DEFAULT '',
-  location TEXT DEFAULT '',
-  duration TEXT DEFAULT '24h',
-  expires_at TEXT,
-  created_at TEXT NOT NULL
+  ip TEXT NOT NULL UNIQUE,         -- 被拉黑的IP
+  reason TEXT DEFAULT '',          -- 拉黑原因
+  location TEXT DEFAULT '',        -- 归属地 (如: 嘉兴市 电信)
+  duration TEXT DEFAULT '24h',     -- 封禁期限: 24h / 1m / 1y / permanent
+  expires_at TEXT,                 -- 过期时间 (NULL表示永久)
+  created_at TEXT NOT NULL         -- 拉黑时间
 );
 
 -- 假码举报表
 CREATE TABLE IF NOT EXISTS reports (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  code TEXT NOT NULL,
-  ip TEXT NOT NULL,
-  submitter_ip TEXT DEFAULT '',
-  status TEXT DEFAULT 'pending',
-  created_at TEXT NOT NULL
+  code TEXT NOT NULL,              -- 被举报的邀请码 (脱敏展示)
+  ip TEXT NOT NULL,                -- 举报人IP
+  submitter_ip TEXT DEFAULT '',    -- 被举报码的提交者IP (用于自动拉黑判断)
+  status TEXT DEFAULT 'pending',   -- pending / handled / dismissed
+  created_at TEXT NOT NULL         -- 举报时间
 );
 
--- 提交日志表
+-- 提交日志表 (用于速率限制和审计)
 CREATE TABLE IF NOT EXISTS submit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ip TEXT NOT NULL,
   code TEXT,
-  action TEXT NOT NULL,
+  action TEXT NOT NULL,            -- submit / use / blocked / ocr_ai / admin_fail
   reason TEXT DEFAULT '',
   created_at TEXT NOT NULL
 );
 
--- 站点设置表
+-- 访问统计表（首页每次访问记录一次，供今日访问量/IP 统计）
+CREATE TABLE IF NOT EXISTS visits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- 站点设置表 (公告、广告、联系方式等)
 CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT,
+  key TEXT PRIMARY KEY,            -- notice / ads / qq_group / qq_owner / smart_enabled ...
+  value TEXT,                      -- 内容 (ads 存 JSON 数组)
   updated_at TEXT NOT NULL
 );
 
--- 索引
+-- 索引：加速查询
+-- 注意：限流/统计类查询都是 (ip, action, created_at) 三条件组合，
+-- 单列索引 idx_logs_ip 会先扫出该 IP 的所有历史日志再过滤，量大后明显变慢；
+-- 复合索引可直接命中。
 CREATE INDEX IF NOT EXISTS idx_codes_status ON codes(status);
 CREATE INDEX IF NOT EXISTS idx_codes_created ON codes(created_at);
+-- 列表查询：WHERE status=? ORDER BY created_at DESC
+CREATE INDEX IF NOT EXISTS idx_codes_status_created ON codes(status, created_at);
+-- 重复提交检查：WHERE code=? AND status IN (...)
+CREATE INDEX IF NOT EXISTS idx_codes_code ON codes(code);
+-- used 码 30 秒轮换清理：WHERE status='used' AND used_at < ?
+CREATE INDEX IF NOT EXISTS idx_codes_used_at ON codes(used_at);
+
 CREATE INDEX IF NOT EXISTS idx_blacklist_ip ON blacklist(ip);
-CREATE INDEX IF NOT EXISTS idx_logs_ip ON submit_logs(ip);
+CREATE INDEX IF NOT EXISTS idx_blacklist_created ON blacklist(created_at);
+
+-- 限流三件套：checkRateLimit / checkDailyLimit / checkActionRateLimit
+CREATE INDEX IF NOT EXISTS idx_logs_ip_action_created ON submit_logs(ip, action, created_at);
+-- 旧的单列 ip 索引已被上面的复合索引完全覆盖（ip 为最左前缀），保留只会增加写放大
+DROP INDEX IF EXISTS idx_logs_ip;
+-- 今日统计：WHERE created_at > ? AND action = ?
+CREATE INDEX IF NOT EXISTS idx_logs_action_created ON submit_logs(action, created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_created ON submit_logs(created_at);
+
+-- visits 限流（WHERE ip=? AND created_at>?）与今日统计
+CREATE INDEX IF NOT EXISTS idx_visits_created ON visits(created_at);
+CREATE INDEX IF NOT EXISTS idx_visits_ip_created ON visits(ip, created_at);
+
 CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);
+-- 举报防刷：WHERE ip=? AND created_at>?
+CREATE INDEX IF NOT EXISTS idx_reports_ip_created ON reports(ip, created_at);
+-- 自动拉黑判定：WHERE submitter_ip=? AND created_at>?
+CREATE INDEX IF NOT EXISTS idx_reports_submitter_created ON reports(submitter_ip, created_at);
 ```
 
 4. 点 **Execute**（执行）按钮
 5. 看到绿色 "Success" 就建好了
+
+> **⚠️ 千万别漏掉 `visits` 表和那几条索引。** 首页的「今日访问量」统计会读 `visits` 表，表不存在的话 `/api/config` 接口会直接报错，**打开首页就是白屏**。限流接口也依赖 `idx_logs_ip_action_created`，缺了会退化成全表扫描。
+>
+> **上面这份 SQL 与仓库里的 [`schema.sql`](https://github.com/jjsxjxj/pdd-fudai/blob/main/schema.sql) 完全一致。** 如果将来代码有更新，判断依据以仓库文件为准——在 GitHub 打开它，点右上角 **Copy raw file** 按钮复制全部内容，再粘贴到这里执行即可（重复执行是安全的，所有语句都带 `IF NOT EXISTS`）。
 
 ---
 
@@ -137,21 +191,31 @@ CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);
 
 ---
 
-## 第 5 步：粘贴代码
+## 第 5 步：获取代码并粘贴到编辑器
 
-1. 进入代码编辑器后，你会看到左边是代码区，右边是预览区
-2. **把左边代码区里的内容全部删掉**（Ctrl+A 全选，然后 Delete）
-3. 打开项目里的 `src/index.js` 文件（用记事本或任何文本编辑器打开）
-4. **Ctrl+A 全选 → Ctrl+C 复制**
-5. 回到 Cloudflare 编辑器，**Ctrl+V 粘贴**
-6. 等代码全部加载完（文件较大，约 89KB，粘贴后等 2~3 秒）
-7. 点右上角 **Deploy**（部署）
+### 5.1 从 GitHub 复制代码（不用装任何软件）
 
-> **⚠️ 注意**：粘贴后检查一下代码开头是不是 `/**`，结尾是不是 `};`。如果开头或结尾被截断了，说明没粘贴完整，重新来一次。
+1. 用浏览器打开源码页面：
+   **https://github.com/jjsxjxj/pdd-fudai/blob/main/src/index.js**
+2. 点代码框右上角的 **Copy raw file**（复制原始文件）按钮 —— 整份代码会复制到剪贴板
+3. 如果没看到这个按钮：点右上角的 **Raw**，在新打开的纯文本页面里按 `Ctrl+A` 全选、`Ctrl+C` 复制
+
+> **⚠️ 不要在 GitHub 的代码预览页直接 Ctrl+A 复制。** 预览页每一行开头都带着行号，粘进编辑器后整份代码都会报语法错误。必须用 **Copy raw file** 按钮或 **Raw** 页面。
+
+### 5.2 粘贴并部署
+
+1. 回到 Cloudflare 代码编辑器（左边是代码区，右边是预览区）
+2. **把左边代码区里的内容全部删掉**（点进代码区，`Ctrl+A` 全选，再按 `Delete`）
+3. `Ctrl+V` 粘贴刚才复制的代码
+4. 等代码加载完（文件约 90KB，粘贴后等 2~3 秒）
+5. 检查代码：**开头应是 `/**`，结尾应是 `};`**。如果被截断了，说明没复制完整，回到 5.1 重来
+6. 点右上角 **Deploy**（部署）
 
 ---
 
-## 第 6 步：绑定数据库
+## 第 6 步：绑定数据库与 AI
+
+### 6.1 绑定数据库（必须）
 
 Worker 需要连上第 2 步建的数据库才能工作。
 
@@ -163,7 +227,22 @@ Worker 需要连上第 2 步建的数据库才能工作。
    - **D1 database**：下拉选择 `pdd-fudai-db`（第 2 步创建的那个）
 5. 点 **Save**（保存）
 
-> **⚠️ 变量名必须填 `DB`**，代码里用的是 `env.DB`，写错就连不上数据库。
+> **⚠️ 变量名必须填 `DB`**，代码里用的是 `env.DB`，写错就连不上数据库，首页会白屏。
+
+### 6.2 绑定 Workers AI（识图功能需要）
+
+不做这一步的话，「识图提取互助码」按钮点了会失败。不需要识图可以跳过。
+
+1. 仍在 **Settings** → **Bindings** 区域，点 **Add binding**
+2. 类型选 **Workers AI**
+3. **Variable name** 填 `AI`（大写）
+4. 点 **Save**（保存）
+
+> **识别方式说明**：绑定 AI 后，识图走服务端 AI（图片会发给 Cloudflare Workers AI 模型处理，不占用本站存储）。
+>
+> 本教程部署的站点缺少 `/ocr/` 那批本地识别资源，所以「本地识别」一定失败——但失败后页面会弹窗让你选「用 AI 识别」，点它就能成功。
+>
+> 想省掉这一步的等待：登录后台 → **站点设置** → 把 **OCR 模式** 改成 **AI**，之后点识图会直接走 AI。
 
 ---
 
@@ -284,6 +363,8 @@ Worker 需要连上第 2 步建的数据库才能工作。
 - **站长 QQ**：同上
 - **智能直达**：开关，开启后首页显示"一键直达"按钮
 - **刷新间隔**：列表自动刷新秒数，默认 5 秒
+- **OCR 模式**：`local`（浏览器本地识别优先）/ `ai`（直接走服务端 AI）。**本教程部署的站点请选 AI** —— 网页版没有本地识别资源（见开头说明）
+- **iOS 快捷指令地址**：首页 iOS 按钮指向的快捷指令链接，留空则隐藏该按钮
 
 ---
 
@@ -291,11 +372,25 @@ Worker 需要连上第 2 步建的数据库才能工作。
 
 ### Q: 打开网站白屏？
 
-检查这几项：
+按顺序检查这几项：
 1. 代码有没有粘贴完整（开头 `/**`，结尾 `};`）
 2. D1 数据库绑定变量名是不是大写的 `DB`
-3. 数据库表有没有建成功（第 3 步）
-4. 去 Worker 的 **Real-time Logs** 看有没有报错
+3. **`visits` 表建了没有** —— 首页的「今日访问量」统计要读它，缺了会让 `/api/config` 接口报错，**页面直接白屏**。把第 3 步的 SQL 重新完整执行一遍即可（所有语句都是 `IF NOT EXISTS`，重复执行安全）
+4. 数据库表有没有全部建成功（第 3 步）
+5. 改完绑定之后，有没有回代码编辑器点过一次 **Deploy**
+6. 去 Worker 页面的 **Real-time Logs** 看具体报错
+
+### Q: 点「识图」没反应，或提示识别失败？
+
+本教程部署的站点**没有本地识别资源**（原因见开头说明），所以：
+
+1. 确认第 6.2 步绑定过 **Workers AI**，且变量名是大写的 `AI`
+2. 绑定后回代码编辑器点一次 **Deploy** 让配置生效
+3. 本地识别失败后，在弹窗里选 **「用 AI 识别」**；或者登录后台把 **OCR 模式** 直接设为 **AI**
+
+如果还是失败，多半是 AI 调用频率限制（同一 IP 每分钟调用次数有限），稍等再试。
+
+> 想要图片不上传、完全在浏览器里识别的「本地识别」，请改用 [命令行部署](DEPLOY.md)——那种方式会把 `public/ocr/` 一并上传。
 
 ### Q: `workers.dev` 打不开？
 
@@ -362,13 +457,15 @@ Worker 需要连上第 2 步建的数据库才能工作。
        ↓
 创建 D1 数据库 (pdd-fudai-db)
        ↓
-执行 SQL 建表 (5 张表 + 6 个索引)
+执行 SQL 建表 (6 张表 + 15 个索引)
        ↓
 创建 Worker (pdd-fudai)
        ↓
-粘贴 src/index.js 全部代码 → Deploy
+从 GitHub 复制 src/index.js（Raw / Copy raw file）→ 粘贴 → Deploy
        ↓
 Settings → Bindings → 添加 D1 绑定 (变量名: DB)
+       ↓
+Settings → Bindings → 添加 Workers AI 绑定 (变量名: AI)  ← 识图功能需要
        ↓
 Settings → Variables → 添加 ADMIN_KEY (Secret)
        ↓

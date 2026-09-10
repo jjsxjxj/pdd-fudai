@@ -4,18 +4,21 @@
 > 全程免费，不需要服务器，不需要域名也能用（有域名更好）。
 > 预计耗时：**15~20 分钟**
 
+> **不想安装任何软件？** 另有一份**纯网页部署教程** → [DEPLOY-WEB.md](DEPLOY-WEB.md)
+> 全程在浏览器里点鼠标完成，不需要 Node.js、不需要命令行。功能上的唯一差别是：网页版用不了 OCR 的「本地识别」（前端资源无法随代码一起上传），只能走「AI 识别」——按该教程绑定 Workers AI 即可正常识图。
+
 ---
 
 ## 目录
 
 1. [你需要准备什么](#1-你需要准备什么)
 2. [注册 Cloudflare 账号](#2-注册-cloudflare-账号)
-3. [安装 Node.js 和 Wrangler](#3-安装-nodejs-和-wrangler)
+3. [安装工具并获取项目代码](#3-安装工具并获取项目代码)
 4. [登录 Cloudflare](#4-登录-cloudflare)
 5. [创建 D1 数据库](#5-创建-d1-数据库)
 6. [初始化数据库表](#6-初始化数据库表)
-7. [设置管理密钥](#7-设置管理密钥)
-8. [部署到 Cloudflare Workers](#8-部署到-cloudflare-workers)
+7. [部署到 Cloudflare Workers](#7-部署到-cloudflare-workers)
+8. [设置管理密钥](#8-设置管理密钥)
 9. [绑定自定义域名（推荐）](#9-绑定自定义域名推荐)
 10. [配置 Cron 定时清空](#10-配置-cron-定时清空)
 11. [后台管理使用指南](#11-后台管理使用指南)
@@ -29,7 +32,8 @@
 |------|---------|------|
 | 电脑（Windows / Mac / Linux） | ✅ 必须 | 用来执行命令 |
 | Cloudflare 账号 | ✅ 必须 | 免费注册 |
-| Node.js 16+ | ✅ 必须 | 运行 Wrangler 工具 |
+| Node.js 22+ | ✅ 必须 | 运行 Wrangler 工具（最新版 Wrangler 要求 Node 22 及以上） |
+| Git | ❌ 可选 | 克隆项目用；没装可从 GitHub 下载 ZIP |
 | 一个域名 | ❌ 可选 | 没有也能用，只是网址长一点 |
 
 > **没有域名？** 部署后会得到一个 `xxx.workers.dev` 的网址，直接用就行。
@@ -48,7 +52,7 @@
 
 ---
 
-## 3. 安装 Node.js 和 Wrangler
+## 3. 安装工具并获取项目代码
 
 ### 3.1 安装 Node.js
 
@@ -60,9 +64,11 @@
    ```bash
    node -v
    ```
-   应该显示类似 `v20.11.0` 的版本号。
+   应该显示 **v22.0.0 或更高**（例如 `v24.11.0`）。
 
    **Mac**：打开「终端」App，输入同样的命令。
+
+> **⚠️ 版本必须 ≥ 22**：最新版 Wrangler 要求 Node 22 及以上，装低了下一步会报 `EBADENGINE`。如果显示的是 v20 或更低，去官网重新下载安装最新 LTS 即可（旧版本可保留，新版本会覆盖默认命令）。
 
 ### 3.2 安装 Wrangler
 
@@ -85,7 +91,24 @@ npm install -g wrangler
 wrangler --version
 ```
 
-应该显示类似 `wrangler 4.0.0` 的版本号。
+应该显示类似 `wrangler 4.x.x` 的版本号。
+
+> 如果这里报 `EBADENGINE ... Required: {"node":">=22.0.0"}`，说明第 3.1 步的 Node 版本太低，回上去升级即可。
+
+### 3.3 获取项目代码
+
+把项目从 GitHub 克隆到本地：
+
+```bash
+git clone https://github.com/jjsxjxj/pdd-fudai.git
+cd pdd-fudai
+```
+
+> **没装 Git？** 两种办法：
+> 1. 从 https://git-scm.com/downloads 下载安装 Git，再执行上面的命令；
+> 2. 打开 https://github.com/jjsxjxj/pdd-fudai，点绿色 **Code → Download ZIP**，下载后解压，再用 `cd` 进入解压出来的目录。
+
+**⚠️ 注意：** 克隆下来的仓库里**没有** `wrangler.toml` 和 `.dev.vars`——它们已加入 `.gitignore`，属于你自己的本地配置。第 7 步会教你怎么生成 `wrangler.toml`。
 
 ---
 
@@ -159,9 +182,66 @@ wrangler d1 execute pdd-fudai-db --remote --file=schema.sql
 
 ---
 
-## 7. 设置管理密钥
+## 7. 部署到 Cloudflare Workers
+
+### 7.1 修改配置文件
+
+先把配置模板复制一份：
+
+```bash
+cp wrangler.toml.example wrangler.toml
+```
+
+打开 `wrangler.toml`，找到这一行：
+
+```toml
+database_id = "abcdef12-3456-7890-abcd-ef1234567890"
+```
+
+把引号里的值替换成 **第 5 步你记下来的 database_id**。
+
+### 7.2 执行部署
+
+在终端执行：
+
+```bash
+wrangler deploy
+```
+
+看到类似这样的输出就成功了：
+
+```
+Total Upload: 89.2 KiB / gzip: 22.1 KiB
+Uploaded pdd-fudai (1.23 sec)
+  Deployed pdd-fudai triggers
+    - https://pdd-fudai.<你的子域名>.workers.dev
+    - cron: 59 15 * * *
+```
+
+### 7.3 打开网站
+
+把输出里的网址复制到浏览器打开，你就能看到首页了！
+
+🎉 **部署成功！**
+
+> **中国大陆用户注意**：`workers.dev` 域名在中国大陆可能打不开。
+> 如果遇到这种情况，请按第 9 步绑定自己的域名。
+
+---
+
+## 8. 设置管理密钥
 
 管理密钥是进后台的密码，一定要设一个复杂的。
+
+**⚠️ 顺序很重要：这一步必须在第 7 步部署成功之后再执行。**
+`wrangler secret put` 要求目标 Worker 已经存在，如果还没部署就直接执行，会报一个很难看懂的错：
+
+```
+✘ [ERROR] A request to the Cloudflare API (/accounts/xxx/workers/scripts/pdd-fudai/secrets) failed.
+  workers.api.error.script_not_found [code: 10007]
+```
+
+遇到这个报错，回到第 7 步先 `wrangler deploy`，再回来设置密钥即可。
 
 在终端执行：
 
@@ -183,52 +263,7 @@ Enter a secret value:
 
 看到 `✅ Success` 就设置成功了。
 
----
-
-## 8. 部署到 Cloudflare Workers
-
-### 8.1 修改配置文件
-
-先把配置模板复制一份：
-
-```bash
-cp wrangler.toml.example wrangler.toml
-```
-
-打开 `wrangler.toml`，找到这一行：
-
-```toml
-database_id = "abcdef12-3456-7890-abcd-ef1234567890"
-```
-
-把引号里的值替换成 **第 5 步你记下来的 database_id**。
-
-### 8.2 执行部署
-
-在终端执行：
-
-```bash
-wrangler deploy
-```
-
-看到类似这样的输出就成功了：
-
-```
-Total Upload: 89.2 KiB / gzip: 22.1 KiB
-Uploaded pdd-fudai (1.23 sec)
-  Deployed pdd-fudai triggers
-    - https://pdd-fudai.<你的子域名>.workers.dev
-    - cron: 59 15 * * *
-```
-
-### 8.3 打开网站
-
-把输出里的网址复制到浏览器打开，你就能看到首页了！
-
-🎉 **部署成功！**
-
-> **中国大陆用户注意**：`workers.dev` 域名在中国大陆可能打不开。
-> 如果遇到这种情况，请按第 9 步绑定自己的域名。
+> **不用再部署一次**：`wrangler secret put` 会自动创建新版本并立即上线，效果等同于执行一次 `deploy`。
 
 ---
 
@@ -323,7 +358,7 @@ crons = ["59 15 * * *"]
 
 1. 打开你的网站地址
 2. 在网址后面加上 `/admin`，例如：`https://fudai.yourdomain.com/admin`
-3. 输入你第 7 步设置的 `ADMIN_KEY` 密码
+3. 输入你第 8 步设置的 `ADMIN_KEY` 密码
 4. 点 **登录**
 
 ### 11.2 站点设置
@@ -386,6 +421,18 @@ crons = ["59 15 * * *"]
 - 数据库表没建（第 6 步漏了）
 - 重新执行 `wrangler deploy`
 
+### Q: 执行 `wrangler secret put` 报 `script_not_found`？
+
+**A:** 说明这个 Worker 还没部署过——`wrangler secret put` 只能给**已存在**的 Worker 设置密钥。
+
+先执行部署：
+
+```bash
+wrangler deploy
+```
+
+部署成功后再执行 `wrangler secret put ADMIN_KEY`。顺序参见第 7、8 步。
+
 ### Q: `workers.dev` 打不开？
 
 **A:** 中国大陆网络环境下 `workers.dev` 域名可能被屏蔽。解决方案：
@@ -394,17 +441,15 @@ crons = ["59 15 * * *"]
 
 ### Q: 后台进不去，提示密码错误？
 
-**A:** 重新设置管理密钥：
+**A:** 重新设置管理密钥（Worker 已在线上，直接执行即可）：
 
 ```bash
 wrangler secret put ADMIN_KEY
 ```
 
-输入新密码后重新部署：
+输入新密码后回车即可生效。
 
-```bash
-wrangler deploy
-```
+> `wrangler secret put` 会自动创建新版本并立即上线，**不需要**再执行一次 `wrangler deploy`。
 
 ### Q: IP 归属地显示英文？
 
@@ -473,26 +518,32 @@ wrangler d1 execute pdd-fudai-db --remote --command "DELETE FROM codes"
 ## 附录：完整部署命令速查
 
 ```bash
-# 1. 安装 Wrangler
+# 1. 克隆项目
+git clone https://github.com/jjsxjxj/pdd-fudai.git
+cd pdd-fudai
+
+# 2. 安装 Wrangler
 npm install -g wrangler
 
-# 2. 登录
+# 3. 登录
 wrangler login
 
-# 3. 创建数据库
+# 4. 创建数据库（记下输出里的 database_id）
 wrangler d1 create pdd-fudai-db
 
-# 4. 建表（记得先 cd 到项目目录）
-cd pdd-fudai
+# 5. 复制配置模板，把 database_id 填进去
+cp wrangler.toml.example wrangler.toml
+
+# 6. 建表
 wrangler d1 execute pdd-fudai-db --remote --file=schema.sql
 
-# 5. 设置管理密钥
-wrangler secret put ADMIN_KEY
-
-# 6. 部署
+# 7. 部署
 wrangler deploy
 
-# 7. 更新代码（修改后重新部署）
+# 8. 设置管理密钥（必须在部署之后，设置完会自动上线）
+wrangler secret put ADMIN_KEY
+
+# 9. 更新代码（修改后重新部署）
 wrangler deploy
 ```
 
