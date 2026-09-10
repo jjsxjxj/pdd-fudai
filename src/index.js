@@ -1590,14 +1590,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .feedback-btn-ios:hover{background:#e8e8ed;border-color:#aeaeb2}
 .feedback-btn-ios .ios-tag{font-size:11px;background:#1d1d1f;color:#fff;border-radius:4px;padding:1px 5px;font-weight:600}
 
-/* 折叠 */
-details{margin-top:15px}
-summary{cursor:pointer;color:#3b82f6;font-weight:bold;font-size:15px;outline:none;padding:5px 0;list-style:none}
-summary::-webkit-details-marker{display:none}
-summary::before{content:"▸ ";margin-right:4px}
-details[open] summary::before{content:"▾ "}
-.instruction-list{line-height:1.8;color:#4b5563;margin:10px 0 0 20px;padding:0;font-size:14px}
-
 /* 滚动公告 */
 .custom-notice-bar{display:flex;align-items:center;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.03);border:1px solid #f1f5f9;padding:8px 10px 8px 0;margin-bottom:15px;position:relative;overflow:hidden;height:44px;box-sizing:border-box}
 .notice-accent{width:4px;height:18px;background:#3b82f6;border-radius:0 4px 4px 0;margin-right:8px;flex-shrink:0}
@@ -1711,8 +1703,6 @@ body{padding:12px}
 .card h1,.card h2{font-size:1.25em}
 .desc-text{font-size:14px;padding:11px 14px}
 .feedback-btn{font-size:13px;padding:11px 0}
-summary{font-size:14px}
-.instruction-list{font-size:13px}
 .input-area{flex-direction:column;align-items:stretch}
 .input-area input{width:100%;margin-bottom:10px}
 .submit-btn,.action-btn,.ocr-btn{width:100%;margin-bottom:10px;min-width:unset}
@@ -1752,16 +1742,6 @@ summary{font-size:14px}
     <!-- iOS 快捷指令：地址由后台「站点设置」配置。未配置过 → 用服务端默认地址；后台显式留空 → 隐藏此按钮。
          链接不写死在模板里，改地址不必重新部署。 -->
     <a class="feedback-btn feedback-btn-ios" id="iosShortcutBtn" style="display:none" target="_blank" rel="noopener">📱 <span>iOS 快捷指令版</span><span class="ios-tag">一键安装</span></a>
-
-    <details>
-      <summary>展开查看详细说明</summary>
-      <ul class="instruction-list">
-        <li>邀请码中间两位会隐藏显示（**）。</li>
-        <li>点击"跳转"后会标记为"已使用"。</li>
-        <li>如果码没被点，再次提交该码即可重新进入队列。</li>
-        <li>活动入口：拼多多首页 - 百亿补贴 - 百亿消费券 - 福袋</li>
-      </ul>
-    </details>
 
   </div>
 
@@ -2352,8 +2332,6 @@ async function reportCode(id) {
     showToast('网络错误', 'error');
   }
 }
-
-// 使用 HTML5 <details>，无需 toggleFold 函数
 
 /** 弹窗通用开关 */
 function openModal(id) { document.getElementById(id).classList.add('show'); }
