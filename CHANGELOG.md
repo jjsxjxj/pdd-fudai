@@ -2,6 +2,24 @@
 
 本项目所有值得注意的变更记录于此。版本按功能里程碑划分，日期为该批改动完成部署的日期。
 
+## [0.8.5] - 2026-09-10
+
+### 新增（SEO 优化，面向搜索引擎收录）
+- **首页 head 全面补齐**：`description` / `keywords` / `robots` / `canonical` / `theme-color`，以及 Open Graph 与 Twitter Card —— 微信、QQ 转发链接时会显示标题与摘要，不再是一条光秃秃的 URL
+- **新增内联 SVG favicon**：搜索结果与浏览器标签页有图标（内联 data URI，不新增文件、不产生额外请求）
+- **新增 JSON-LD 结构化数据**：`WebSite` + `FAQPage` 两组，为 Google 富媒体结果提供依据
+- **页面语义修正**：首页主标题由 `<h2>` 改为 `<h1>`（此前整站没有 h1），复用原 h2 样式，视觉不变
+- **新增服务端渲染的说明文案区**（页面底部）：介绍平台用途、使用步骤、常见问题与合规说明。**可被爬虫读到的正文由 388 字提升到 1104 字**（此前互助码列表由 AJAX 加载，爬虫只能看到「加载中...」）
+- **新增 `/sitemap.xml`**：含首页 URL、`lastmod`（取部署日期）、`changefreq`、`priority`
+- **`robots.txt` 增强**：显式 `Allow: /` 并声明 `Sitemap:` 地址
+
+### 安全
+- **后台页面增加 `noindex,nofollow`**：在 `robots.txt` 之外再上一道保险，防止后台页面被搜索引擎收录
+
+### 运维
+- 新增 `CONFIG.SITE_ORIGIN`（站点域名统一引用，换域名只改一处）与 `CONFIG.SEO_VERIFY_BAIDU` / `CONFIG.SEO_VERIFY_GOOGLE` 验证码占位；填入验证串后自动输出对应站长平台的验证 meta
+- 修正 `scripts/check-inline-js.cjs`：模板字符串引入 `${CONFIG.xxx}` 插值后，原提取方式的作用域缺少 `CONFIG` 会直接报错，现会把依赖常量一并注入求值上下文
+
 ## [0.8.4] - 2026-09-10
 
 ### 修复

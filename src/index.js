@@ -32,6 +32,12 @@ const CONFIG = {
   // iOS 快捷指令默认地址：后台「站点设置」未配置过 ios_url 时首页用这个；
   // 后台显式保存为空则首页不显示该按钮（区分「未配置」与「配置为空」两种语义）
   IOS_SHORTCUT_URL: 'https://www.icloud.com/shortcuts/e5dacaf5c4dc4809bca41848175373c1',
+  // 站点正式域名：canonical / og:url / sitemap.xml / robots.txt 统一引用这里，换域名只改一处
+  SITE_ORIGIN: 'https://fudai.10087.eu.org',
+  // SEO 站长平台验证码：在对应平台添加站点后把验证串填到这里；留空则不输出该 meta 标签。
+  // 百度搜索资源平台 ziyuan.baidu.com → HTML 标签验证；Google Search Console → HTML 标记
+  SEO_VERIFY_BAIDU: '',
+  SEO_VERIFY_GOOGLE: '',
 };
 
 /** 需要黑名单拦截的公开写接口（被拉黑的 IP 不仅不能提交，也不能领码/举报/刷 AI 额度） */
@@ -1484,11 +1490,36 @@ export default {
       return servePage('admin');
     }
 
+    // 站点地图：当前只有首页一个可收录 URL
+    // ⚠️ lastmod 必须在请求内计算：Workers 全局作用域的 new Date() 会被钉在 1970-01-01
+    if (path === '/sitemap.xml') {
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>${CONFIG.SITE_ORIGIN}/</loc>
+    <lastmod>${new Date().toISOString().slice(0, 10)}</lastmod>
+    <changefreq>hourly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>`;
+      // 不设 Cache-Control：Worker 动态响应默认不进边缘缓存。
+      // 这里刻意不缓存 —— lastmod 随日期变化，若被缓存会把过期日期固化住。
+      return new Response(xml, {
+        headers: { 'Content-Type': 'application/xml; charset=utf-8' },
+      });
+    }
+
     // 明确告知爬虫不要收录后台
     if (path === '/robots.txt') {
-      return new Response('User-agent: *\nDisallow: /admin\nDisallow: /api/\n', {
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-      });
+      return new Response(
+        'User-agent: *\n' +
+        'Allow: /\n' +
+        'Disallow: /admin\n' +
+        'Disallow: /api/\n' +
+        '\n' +
+        'Sitemap: ' + CONFIG.SITE_ORIGIN + '/sitemap.xml\n',
+        { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
+      );
     }
 
     return new Response('Not Found', { status: 404 });
@@ -1513,7 +1544,27 @@ const INDEX_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDD福袋五折互助</title>
+<title>PDD福袋邀请码互助 - 拼多多福袋五折互助码免费分享</title>
+<meta name="description" content="免费的拼多多福袋邀请码互助平台：提交并分享福袋五折邀请码，实时更新互助码列表，一键跳转拼多多搜索助力。支持识图提取、违规公示，每日自动清理，无需注册。">
+<meta name="keywords" content="拼多多福袋,福袋互助,PDD福袋,拼多多邀请码,福袋五折,百亿补贴福袋,福袋助力,福袋互助码">
+<meta name="robots" content="index,follow">
+<meta name="theme-color" content="#2563eb">
+<link rel="canonical" href="${CONFIG.SITE_ORIGIN}/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Ctext x='32' y='41' font-size='20' text-anchor='middle' fill='%23ffffff' font-family='sans-serif' font-weight='bold'%3EPDD%3C/text%3E%3C/svg%3E">
+${CONFIG.SEO_VERIFY_GOOGLE ? '<meta name="google-site-verification" content="' + CONFIG.SEO_VERIFY_GOOGLE + '">' : ''}
+${CONFIG.SEO_VERIFY_BAIDU ? '<meta name="baidu-site-verification" content="' + CONFIG.SEO_VERIFY_BAIDU + '">' : ''}
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="PDD福袋五折互助">
+<meta property="og:title" content="PDD福袋邀请码互助 - 拼多多福袋五折互助码免费分享">
+<meta property="og:description" content="免费的拼多多福袋邀请码互助平台：提交并分享福袋五折邀请码，实时更新互助码列表，一键跳转拼多多搜索助力。">
+<meta property="og:url" content="${CONFIG.SITE_ORIGIN}/">
+<meta property="og:locale" content="zh_CN">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="PDD福袋邀请码互助 - 拼多多福袋五折互助码免费分享">
+<meta name="twitter:description" content="免费的拼多多福袋邀请码互助平台：提交并分享福袋五折邀请码，一键跳转拼多多搜索助力。">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@graph":[{"@type":"WebSite","@id":"${CONFIG.SITE_ORIGIN}/#website","url":"${CONFIG.SITE_ORIGIN}/","name":"PDD福袋五折互助","alternateName":"拼多多福袋邀请码互助平台","description":"免费的拼多多福袋邀请码互助平台，实时分享福袋五折邀请码。","inLanguage":"zh-CN"},{"@type":"FAQPage","@id":"${CONFIG.SITE_ORIGIN}/#faq","mainEntity":[{"@type":"Question","name":"使用拼多多福袋互助码需要注册或付费吗？","acceptedAnswer":{"@type":"Answer","text":"不需要。本站不收集手机号、不要求登录，提交与查询完全免费。"}},{"@type":"Question","name":"什么是拼多多福袋互助码？","acceptedAnswer":{"@type":"Answer","text":"拼多多福袋活动需要好友助力才能领取五折券，助力时用到的 8~9 位邀请码就是福袋互助码。"}},{"@type":"Question","name":"为什么邀请码中间两位显示为星号？","acceptedAnswer":{"@type":"Answer","text":"为了防止邀请码被批量抓取和恶意刷单，隐藏中间两位不影响他人正常助力。"}},{"@type":"Question","name":"提交的邀请码会一直显示吗？","acceptedAnswer":{"@type":"Answer","text":"不会。邀请码有有效期，被标记已使用后一段时间会自动轮换下架，重新提交即可重新进入列表。"}}]}]}
+</script>
 <script src="/ocr/tesseract.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1522,7 +1573,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 
 /* 大白卡 */
 .card{background:#fff;padding:20px;border-radius:16px;box-shadow:0 4px 20px rgba(59,130,246,.08);margin-bottom:20px;border:1px solid #e0f2fe}
-.card h2{text-align:center;color:#2563eb;margin:0 0 15px;font-size:1.4em;font-weight:700}
+.card h1,.card h2{text-align:center;color:#2563eb;margin:0 0 15px;font-size:1.4em;font-weight:700}
 
 /* 灰底描述段 */
 .desc-text{color:#4b5563;font-size:15px;line-height:1.7;text-align:left;margin:0;background:#f8fafc;padding:12px 16px;border-radius:10px}
@@ -1657,7 +1708,7 @@ details[open] summary::before{content:"▾ "}
 @media (max-width:600px){
 body{padding:12px}
 .card{padding:16px;border-radius:14px}
-.card h2{font-size:1.25em}
+.card h1,.card h2{font-size:1.25em}
 .desc-text{font-size:14px;padding:11px 14px}
 .feedback-btn{font-size:13px;padding:11px 0}
 summary{font-size:14px}
@@ -1672,6 +1723,15 @@ summary{font-size:14px}
 .stat-num{font-size:18px}
 .stat-label{font-size:10px}
 }
+
+/* SEO 文案区（服务端渲染，供搜索引擎索引） */
+.seo-block{background:#fff;border:1px solid #e0f2fe;border-radius:16px;padding:20px;margin-bottom:20px;color:#4b5563;font-size:14px;line-height:1.8;text-align:left}
+.seo-block h2{color:#2563eb;font-size:1.15em;margin:0 0 10px}
+.seo-block h3{color:#374151;font-size:1em;margin:16px 0 6px}
+.seo-block p{margin:0 0 10px}
+.seo-block ol,.seo-block ul{margin:0 0 10px;padding-left:20px}
+.seo-block li{margin-bottom:4px}
+.seo-block .seo-note{color:#9ca3af;font-size:12px;margin:14px 0 0;padding-top:10px;border-top:1px dashed #e5e7eb}
 </style>
 </head>
 <body>
@@ -1679,7 +1739,7 @@ summary{font-size:14px}
 
   <!-- ===== 第一张大白卡 ===== -->
   <div class="card">
-    <h2>PDD福袋五折互助</h2>
+    <h1>PDD福袋五折互助</h1>
     <p class="desc-text">
       ① 输入8-9位邀请码提交，支持重复提交点亮<br>
       ② 列表点"跳转"自动打开拼多多搜索<br>
@@ -1749,6 +1809,30 @@ summary{font-size:14px}
     <!-- 互助码列表 -->
     <ul id="numberList" class="list"><li class="loading" style="text-align:center;padding:20px;color:#999;list-style:none">加载中...</li></ul>
   </div>
+
+  <!-- ===== SEO 内容区：服务端渲染的静态文案，供搜索引擎索引，同时帮助新用户了解用法 ===== -->
+  <footer class="seo-block">
+    <h2>关于 PDD 福袋五折互助</h2>
+    <p><strong>PDD 福袋五折互助</strong>是一个免费的<strong>拼多多福袋邀请码互助平台</strong>。拼多多「百亿补贴 · 百亿消费券」的福袋活动需要好友助力才能领到五折券，而每个人的好友数量有限。本站把大家手上的福袋邀请码汇集在一起：你提交自己的码，就能同时看到别人提交的码，互相助力，提高五折券的领取成功率。</p>
+    <h3>使用步骤</h3>
+    <ol>
+      <li>在拼多多 App 打开福袋活动（首页 → 百亿补贴 → 百亿消费券 → 福袋），复制你的 8~9 位邀请码；</li>
+      <li>回到本站，把邀请码粘贴到输入框，点「立即提交」；</li>
+      <li>在下方列表里找别人的码，点「跳转」会自动打开拼多多搜索并完成助力；</li>
+      <li>别人助力你的码之后，你就能在拼多多里领取对应的五折券。</li>
+    </ol>
+    <h3>常见问题</h3>
+    <ul>
+      <li><strong>需要注册或付费吗？</strong>不需要。本站不收集手机号、不要求登录，提交与查询完全免费。</li>
+      <li><strong>为什么邀请码中间两位是隐藏的？</strong>为防止被批量抓取和恶意刷单，隐藏部分不影响正常助力。</li>
+      <li><strong>提交后为什么还要去点别人的码？</strong>互助是双向的：你的码被别人助力，同时你也助力别人，整体成功率才高。</li>
+      <li><strong>我的码为什么不见了？</strong>邀请码有有效期，被标记「已使用」后一段时间会自动轮换下架，重新提交即可重新进入队列。</li>
+      <li><strong>提交不相关的码会怎样？</strong>会被其他用户举报，达到阈值后自动进入小黑屋公示并限制提交。</li>
+    </ul>
+    <h3>合规说明</h3>
+    <p>本站为爱好者搭建的互助信息展示平台，<strong>与拼多多官方无任何隶属或合作关系</strong>。站内邀请码均由用户自行提交，本站不对其真实性作担保。若你是权利方并认为本站内容不当，可通过站内「联系我们」反馈，我们会及时处理。</p>
+    <p class="seo-note">PDD福袋五折互助 · 免费拼多多福袋邀请码互助平台 · 数据每日自动清理</p>
+  </footer>
 
 </div>
 
@@ -2493,6 +2577,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>管理后台 - PDD福袋互助</title>
+<meta name="robots" content="noindex,nofollow">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5;color:#333}
