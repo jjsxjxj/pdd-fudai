@@ -38,7 +38,7 @@ const CONFIG = {
   // 百度搜索资源平台 ziyuan.baidu.com → HTML 标签验证；Google Search Console → HTML 标记；
   // 必应 Bing Webmaster Tools（bing.com/webmasters）→「HTML Meta 标记」给的 msvalidate.01
   SEO_VERIFY_BAIDU: '',
-  SEO_VERIFY_GOOGLE: '',
+  SEO_VERIFY_GOOGLE: 'YOUR_GOOGLE_VERIFY_TOKEN',
   SEO_VERIFY_BING: 'YOUR_BING_VERIFY_TOKEN',
 };
 

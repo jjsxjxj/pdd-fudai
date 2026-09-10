@@ -5,7 +5,8 @@
 ## [0.8.6] - 2026-09-11
 
 ### 新增
-- **必应站长平台验证**：新增 `CONFIG.SEO_VERIFY_BING`，填入验证串后首页 head 自动输出 `<meta name="msvalidate.01">`，供 Bing Webmaster Tools 完成站点归属验证。
+- **启用 Google Search Console 站点验证**：`CONFIG.SEO_VERIFY_GOOGLE` 填入验证串后，首页 head 输出 `<meta name="google-site-verification">`，供 Google 完成站点归属验证，验证通过即可提交 `sitemap.xml`。
+- **启用必应站长平台验证**：新增 `CONFIG.SEO_VERIFY_BING`，填入验证串后首页 head 自动输出 `<meta name="msvalidate.01">`，供 Bing Webmaster Tools 完成站点归属验证。
 
 ### 优化
 - **移除首页「展开查看详细说明」折叠块**：该块原本列出 4 条规则（邀请码打码规则、跳转后标记「已使用」、未被点击可重新提交入队、活动入口路径），这些内容现已完整包含在页面底部的说明区（「使用步骤」与「常见问题」）中，属重复信息，故整块移除，首页更清爽。
