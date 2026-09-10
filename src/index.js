@@ -2560,6 +2560,7 @@ tr:hover{background:#fafafa}
     <button onclick="switchTab('blacklist',this)">IP黑名单</button>
     <button onclick="switchTab('reports',this)">举报管理</button>
     <button onclick="switchTab('logs',this)">提交日志</button>
+    <button style="margin-left:auto;background:#fff;color:#999" onclick="doLogout()">退出登录</button>
   </div>
 
   <!-- 统计 -->
@@ -2721,6 +2722,49 @@ tr:hover{background:#fafafa}
 var adminKey = '';
 var codesPage = 1, logsPage = 1, reportsPage = 1;
 
+/**
+ * 登录态存储：sessionStorage
+ * 刷新 / 页面重载（含手机切后台被系统回收）后自动恢复；关闭标签页即清除，
+ * 密钥不会长期留在浏览器里。
+ */
+var KEY_STORE = 'pddAdminKey';
+var authNotified = false;
+
+function readStoredKey() {
+  try { return sessionStorage.getItem(KEY_STORE) || ''; } catch (e) { return ''; }
+}
+
+function writeStoredKey(k) {
+  try {
+    if (k) sessionStorage.setItem(KEY_STORE, k);
+    else sessionStorage.removeItem(KEY_STORE);
+  } catch (e) {}
+}
+
+/** 进入后台面板 */
+function showPanel() {
+  document.getElementById('loginBox').classList.add('hidden');
+  document.getElementById('adminPanel').classList.remove('hidden');
+}
+
+/** 清掉登录态并回到登录框 */
+function showLogin(msg) {
+  adminKey = '';
+  writeStoredKey('');
+  var ap = document.getElementById('adminPanel');
+  if (ap) ap.classList.add('hidden');
+  var lb = document.getElementById('loginBox');
+  if (lb) lb.classList.remove('hidden');
+  var inp = document.getElementById('adminKeyInput');
+  if (inp) inp.value = '';
+  if (msg) alert(msg);
+}
+
+/** 主动退出登录 */
+function doLogout() {
+  showLogin();
+}
+
 /** HTML 转义：管理后台所有动态值（归属地/原因/码等）拼 innerHTML 前先转义 */
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
@@ -2748,22 +2792,42 @@ function maskIPAdmin(ip) {
 function api(path, opts) {
   opts = opts || {};
   opts.headers = opts.headers || {};
-  opts.headers['X-Admin-Key'] = adminKey;
-  return fetch(path, opts).then(function(r){ return r.json(); });
+  if (adminKey) opts.headers['X-Admin-Key'] = adminKey;
+  return fetch(path, opts).then(function(r) {
+    // 密钥失效：清掉本地登录态并回到登录框（并发请求只提示一次）
+    if (r.status === 401) {
+      if (!authNotified) {
+        authNotified = true;
+        showLogin('登录已过期，请重新登录');
+        setTimeout(function(){ authNotified = false; }, 1500);
+      }
+      return { success: false };
+    }
+    return r.json();
+  });
 }
 
 function doLogin() {
-  adminKey = document.getElementById('adminKeyInput').value.trim();
-  if (!adminKey) return;
-  api('/api/admin/stats').then(function(data) {
-    if (data.success) {
-      document.getElementById('loginBox').classList.add('hidden');
-      document.getElementById('adminPanel').classList.remove('hidden');
-      loadStats();
-    } else {
-      alert('密钥错误');
-    }
-  }).catch(function(){ alert('登录失败'); });
+  var v = document.getElementById('adminKeyInput').value.trim();
+  if (!v) return;
+  // 不走 api()：登录失败时不该被当成「登录已过期」
+  fetch('/api/admin/stats', { headers: { 'X-Admin-Key': v } })
+    .then(function(r) {
+      if (r.status === 401) { alert('密钥错误'); return null; }
+      return r.json();
+    })
+    .then(function(data) {
+      if (!data) return;
+      if (data.success) {
+        adminKey = v;
+        writeStoredKey(v);
+        showPanel();
+        loadStats();
+      } else {
+        alert('密钥错误');
+      }
+    })
+    .catch(function(){ alert('登录失败'); });
 }
 
 function switchTab(tab, btn) {
@@ -3025,6 +3089,23 @@ function renderPageNav(elId, pagination, loadFn) {
   if (pagination.page < totalPages) html += '<button onclick="' + loadFn.name + '(' + (pagination.page+1) + ')">下一页</button>';
   el.innerHTML = html;
 }
+
+// 页面加载时自动恢复登录态（sessionStorage）
+(function restoreSession() {
+  var k = readStoredKey();
+  if (!k) return;
+  adminKey = k;
+  fetch('/api/admin/stats', { headers: { 'X-Admin-Key': k } })
+    .then(function(r) {
+      if (r.status === 401) { adminKey = ''; writeStoredKey(''); return null; }
+      return r.json();
+    })
+    .then(function(data) {
+      if (data && data.success) { showPanel(); loadStats(); }
+      else { adminKey = ''; writeStoredKey(''); }
+    })
+    .catch(function() { adminKey = ''; });
+})();
 </script>
 </body>
 </html>`;
