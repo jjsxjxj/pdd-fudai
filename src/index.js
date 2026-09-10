@@ -35,9 +35,11 @@ const CONFIG = {
   // 站点正式域名：canonical / og:url / sitemap.xml / robots.txt 统一引用这里，换域名只改一处
   SITE_ORIGIN: 'https://fudai.10087.eu.org',
   // SEO 站长平台验证码：在对应平台添加站点后把验证串填到这里；留空则不输出该 meta 标签。
-  // 百度搜索资源平台 ziyuan.baidu.com → HTML 标签验证；Google Search Console → HTML 标记
+  // 百度搜索资源平台 ziyuan.baidu.com → HTML 标签验证；Google Search Console → HTML 标记；
+  // 必应 Bing Webmaster Tools（bing.com/webmasters）→「HTML Meta 标记」给的 msvalidate.01
   SEO_VERIFY_BAIDU: '',
   SEO_VERIFY_GOOGLE: '',
+  SEO_VERIFY_BING: 'YOUR_BING_VERIFY_TOKEN',
 };
 
 /** 需要黑名单拦截的公开写接口（被拉黑的 IP 不仅不能提交，也不能领码/举报/刷 AI 额度） */
@@ -1553,6 +1555,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Ctext x='32' y='41' font-size='20' text-anchor='middle' fill='%23ffffff' font-family='sans-serif' font-weight='bold'%3EPDD%3C/text%3E%3C/svg%3E">
 ${CONFIG.SEO_VERIFY_GOOGLE ? '<meta name="google-site-verification" content="' + CONFIG.SEO_VERIFY_GOOGLE + '">' : ''}
 ${CONFIG.SEO_VERIFY_BAIDU ? '<meta name="baidu-site-verification" content="' + CONFIG.SEO_VERIFY_BAIDU + '">' : ''}
+${CONFIG.SEO_VERIFY_BING ? '<meta name="msvalidate.01" content="' + CONFIG.SEO_VERIFY_BING + '">' : ''}
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="PDD福袋五折互助">
 <meta property="og:title" content="PDD福袋邀请码互助 - 拼多多福袋五折互助码免费分享">
