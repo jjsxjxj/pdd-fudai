@@ -33,7 +33,7 @@ const CONFIG = {
   // 后台显式保存为空则首页不显示该按钮（区分「未配置」与「配置为空」两种语义）
   IOS_SHORTCUT_URL: 'https://www.icloud.com/shortcuts/e5dacaf5c4dc4809bca41848175373c1',
   // 站点正式域名：canonical / og:url / sitemap.xml / robots.txt 统一引用这里，换域名只改一处
-  SITE_ORIGIN: 'https://your-domain.example.com',
+  SITE_ORIGIN: 'https://fudai.10087.eu.org',
   // SEO 站长平台验证码：在对应平台添加站点后把验证串填到这里；留空则不输出该 meta 标签。
   // 百度搜索资源平台 ziyuan.baidu.com → HTML 标签验证；Google Search Console → HTML 标记；
   // 必应 Bing Webmaster Tools（bing.com/webmasters）→「HTML Meta 标记」给的 msvalidate.01
