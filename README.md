@@ -2,7 +2,7 @@
 
 基于 Cloudflare Workers + D1 数据库的拼多多福袋邀请码互助平台。
 
-**线上地址**: https://fudai.10087.eu.org
+**线上地址**: 部署到 Cloudflare 后，用你自己的域名访问即可
 
 **部署教程**: [Cloudflare Workers 部署指南 - 我的博客](https://813146.xyz/post/deploy-cloudflare-workers-via-dashboard)
 
@@ -53,12 +53,13 @@
 - 弹窗广告的标题/副标题由后台配置（留空则不渲染标题栏），项目内不含任何硬编码的第三方品牌文案
 - 无广告时全部自动隐藏，`/api/config` 也不返回 `ads` / `ad_title` / `ad_sub` 字段
 
-### 识图提取（OCR 自动识别互助码）
-- 首页上传/截图福袋分享图，一键识别 8-9 位互助码，免去手动输入
-- **本地识别优先**：tesseract.js 在浏览器端运行，图片不上传（首次加载约 15 秒，之后缓存秒开）
-- OCR 运行时与训练数据**同域自托管**（`public/ocr/`，随 Worker Assets 部署到 `/ocr/`），不依赖任何第三方 CDN，国内加载无障碍
-- 本地识别失败时可切换 **AI 识图兜底**（Cloudflare Workers AI `llama-3.2-11b-vision`），后台可配置 `ocr_mode`：`local`（本地优先）/ `ai`（仅 AI）
-- AI 识图接口带限流与降级提示
+### 识别截图（秒出互助码，不加载模型）
+- 点输入框右侧的「识别截图」，选一张福袋分享图或手机整屏截图，自动认出 8-9 位互助码
+- **本地像素识别，毫秒级出结果**：拼多多邀请码是固定字体的受控印刷体，不必跑 OCR 模型，直接用「红区定位 → Otsu 行分离 → 列切分 → 间隙聚类 → 6×8 归一化栅格比模板」在浏览器内存里算完 —— **零网络请求、零模型下载、图片不出本机**
+- 识别成功后弹「识别结果确认」窗：展示裁出的**码区原图** + 可编辑的码，核对无误再提交，避免认错一位数字
+- 低置信度或没识别到时，可选 **AI 识图兜底**（Cloudflare Workers AI `llama-3.2-11b-vision`）。后台 `ocr_mode`：`local`（仅本地，默认）/ `ai`（本地 + AI 兜底）
+- AI 识图接口带 IP 限流与降级提示
+- 实测：1240×2772 安卓整屏截图约 50ms，缩到 900px 宽约 10~26ms
 
 ### 提交秒回（异步归属地补全）
 - 提交互力码**即时返回**，不再等待归属地查询
@@ -102,31 +103,31 @@
 
 ```
 用户浏览器 ──┬── 页面 + 公开 API ──→ Cloudflare Workers ──→ D1 (SQLite)
-             │                          ├─ Workers AI（OCR 兜底，可选）
-             │                          ├─ ctx.waitUntil（归属地后台补全）
-             │                          └─ ASSETS 静态资源（/ocr/，tesseract.js 同域自托管）
-             └── OCR 本地识别（tesseract.js WASM，图片不出浏览器）
+             │                          ├─ Workers AI（识图兜底，可选）
+             │                          └─ ctx.waitUntil（归属地后台补全）
+             └── 识别截图（像素模板匹配，算法内联在页面代码里，图片不出浏览器）
                                             ↓
                               Cron Trigger 23:59 CST → 清空互助码
 ```
 
 - **运行时**: Cloudflare Workers
 - **数据库**: Cloudflare D1 (SQLite)
-- **静态资源**: Worker Assets（`public/` 目录 → 同域 `/ocr/`，无跨域问题）
 - **定时任务**: Cron Trigger `59 15 * * *`（23:59 CST）
-- **前端**: 内联 HTML/CSS/JS（无需额外静态托管）
-- **OCR**: tesseract.js 浏览器端本地识别 + Workers AI 兜底
+- **前端**: 内联 HTML/CSS/JS（单文件部署，无需静态资源绑定）
+- **识别截图**: 浏览器端像素模板匹配（算法内联在页面里）+ Workers AI 兜底
 
 ## 部署步骤
 
 本项目提供两套部署教程，按自己的情况任选其一：
 
-| 方式 | 是否需要命令行 | 需要装软件 | OCR 识图 | 详细教程 |
+| 方式 | 是否需要命令行 | 需要装软件 | 识别截图 | 详细教程 |
 |------|--------------|-----------|---------|---------|
-| **A. 命令行部署（推荐）** | 需要 | Node.js + Wrangler | ✅ 本地识别 + AI 兜底 | 本文下方步骤 / [DEPLOY.md](DEPLOY.md)（手把手详解） |
-| **B. 纯网页部署** | 不需要 | 无，全程浏览器 | ⚠️ 仅 AI 识别（需绑定 Workers AI） | [DEPLOY-WEB.md](DEPLOY-WEB.md) |
+| **A. 命令行部署（推荐）** | 需要 | Node.js + Wrangler | ✅ 秒出 | 本文下方步骤 / [DEPLOY.md](DEPLOY.md)（手把手详解） |
+| **B. 纯网页部署** | 不需要 | 无，全程浏览器 | ✅ 秒出 | [DEPLOY-WEB.md](DEPLOY-WEB.md) |
 
-> **两种方式唯一的差别在 OCR 识图**：OCR 的「本地识别」依赖 tesseract.js 运行时与模型（约 20MB，在 `public/ocr/`），必须随 Worker Assets 一并上传，而 Cloudflare 的网页编辑器只能保存单个代码文件，无法上传这批资源。所以网页版只能走「AI 识别」路径——按网页版教程第 6 步绑定 Workers AI 即可正常识图。其余功能两种方式完全一致。
+> **两种方式功能完全一致**：「识别截图」用的是**内联在 `src/index.js` 里的像素匹配算法**，不需要额外上传任何静态资源，所以只能粘贴单个代码文件的网页版，同样能秒出结果。
+>
+> 唯一可选的一步是 **AI 识图兜底**——它需要在 Cloudflare 后台绑定 Workers AI（网页版教程第 6.2 步）。不绑定也不影响识别截图，只是本地没认出码时少一层重试。
 
 以下为 **方式 A：命令行部署** 的完整步骤。
 
@@ -183,7 +184,7 @@ wrangler d1 execute pdd-fudai-db --remote --file=schema.sql
 wrangler deploy
 ```
 
-`public/ocr/` 下的 OCR 运行时（约 20MB）会随 Worker Assets 一并部署到同域 `/ocr/`。
+无需上传任何静态资源 —— 识别截图的算法已经内联在 `src/index.js` 里。
 
 ### 8. 设置管理密钥
 
@@ -225,7 +226,6 @@ wrangler secret put ADMIN_KEY
 | 字段 | 说明 |
 |------|------|
 | `routes` | 自定义域名绑定（pattern + zone_id） |
-| `[assets]` | 静态资源绑定（`public/` → 同域 `/ocr/`，OCR 运行时自托管） |
 | `d1_databases` | D1 数据库绑定（binding = "DB"） |
 | `[ai]` | Workers AI 绑定（binding = "AI"，OCR 兜底） |
 | `triggers.crons` | Cron 定时任务（`59 15 * * *` = 23:59 CST 清空码） |
@@ -240,7 +240,7 @@ wrangler secret put ADMIN_KEY
 | GET | `/api/config` | 获取首页配置 + 今日统计 |
 | POST | `/api/visit` | 记录访问 |
 | POST | `/api/submit` | 提交邀请码（即时返回，归属地后台补全） |
-| POST | `/api/ocr` | AI 识图提取互助码（限流，本地识别失败时兜底） |
+| POST | `/api/ocr` | AI 识图提取互助码（本地识别没认出时的兜底，带 IP 限流） |
 | POST | `/api/use/:id` | 标记已使用，返回完整码 |
 | POST | `/api/quick-use` | 智能直达 |
 | GET | `/api/blacklist` | 公共黑名单公示（分页，`pageSize` 上限 200；自动排除已过期记录） |
@@ -266,9 +266,7 @@ wrangler secret put ADMIN_KEY
 ```
 pdd-fudai/
 ├── src/
-│   └── index.js              # Worker 主文件（API + 内联前端 + 内联管理后台）
-├── public/
-│   └── ocr/                  # OCR 运行时（tesseract.js 主库/worker/core WASM/英文训练数据，约 20MB）
+│   └── index.js              # Worker 主文件（API + 内联前端 + 内联管理后台 + 内联识别内核）
 ├── scripts/                  # 本地开发工具（不入 git，不上传）
 ├── schema.sql                # D1 数据库建表脚本
 ├── wrangler.toml.example     # 部署配置模板（脱敏，复制为 wrangler.toml 使用）

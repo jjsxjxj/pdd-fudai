@@ -12,11 +12,7 @@ routes = [
   { pattern = "fudai.yourdomain.com/*", zone_id = "YOUR_ZONE_ID" }
 ]
 
-# 静态资源（OCR 模型与 tesseract.js 运行时，同域自托管，见 public/ocr/）
-[assets]
-directory = "./public"
-binding = "ASSETS"
-not_found_handling = "none"
+# 无需静态资源绑定：识别截图在前端用像素模板匹配完成（算法内置在页面里），不加载任何模型文件
 
 # D1 数据库绑定
 # 部署前先执行: wrangler d1 create pdd-fudai-db，把输出的 database_id 填到下面

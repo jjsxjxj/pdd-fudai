@@ -1305,7 +1305,7 @@ async function handleAPI(request, env, path, ctx) {
     return handleSubmit(env.DB, request, ip, ctx);
   }
 
-  // 识图提取（Cloudflare Workers AI 视觉模型）
+  // 识别截图 · AI 兜底（Cloudflare Workers AI 视觉模型）
   if (path === '/api/ocr' && method === 'POST') {
     return handleOcr(request, env, ip);
   }
@@ -1479,11 +1479,6 @@ export default {
       }
     }
 
-    // 静态资源（OCR 模型等，由 Worker Assets 直接托管）
-    if (path.startsWith('/ocr/')) {
-      return env.ASSETS.fetch(request);
-    }
-
     // 静态页面
     if (path === '/' || path === '/index.html') {
       return servePage('index');
@@ -1547,7 +1542,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PDD福袋邀请码互助 - 拼多多福袋五折互助码免费分享</title>
-<meta name="description" content="免费的拼多多福袋邀请码互助平台：提交并分享福袋五折邀请码，实时更新互助码列表，一键跳转拼多多搜索助力。支持识图提取、违规公示，每日自动清理，无需注册。">
+<meta name="description" content="免费的拼多多福袋邀请码互助平台：提交并分享福袋五折邀请码，实时更新互助码列表，一键跳转拼多多搜索助力。支持截图识别邀请码、违规公示，每日自动清理，无需注册。">
 <meta name="keywords" content="拼多多福袋,福袋互助,PDD福袋,拼多多邀请码,福袋五折,百亿补贴福袋,福袋助力,福袋互助码">
 <meta name="robots" content="index,follow">
 <meta name="theme-color" content="#2563eb">
@@ -1568,7 +1563,6 @@ ${CONFIG.SEO_VERIFY_BING ? '<meta name="msvalidate.01" content="' + CONFIG.SEO_V
 <script type="application/ld+json">
 {"@context":"https://schema.org","@graph":[{"@type":"WebSite","@id":"${CONFIG.SITE_ORIGIN}/#website","url":"${CONFIG.SITE_ORIGIN}/","name":"PDD福袋五折互助","alternateName":"拼多多福袋邀请码互助平台","description":"免费的拼多多福袋邀请码互助平台，实时分享福袋五折邀请码。","inLanguage":"zh-CN"},{"@type":"FAQPage","@id":"${CONFIG.SITE_ORIGIN}/#faq","mainEntity":[{"@type":"Question","name":"使用拼多多福袋互助码需要注册或付费吗？","acceptedAnswer":{"@type":"Answer","text":"不需要。本站不收集手机号、不要求登录，提交与查询完全免费。"}},{"@type":"Question","name":"什么是拼多多福袋互助码？","acceptedAnswer":{"@type":"Answer","text":"拼多多福袋活动需要好友助力才能领取五折券，助力时用到的 8~9 位邀请码就是福袋互助码。"}},{"@type":"Question","name":"为什么邀请码中间两位显示为星号？","acceptedAnswer":{"@type":"Answer","text":"为了防止邀请码被批量抓取和恶意刷单，隐藏中间两位不影响他人正常助力。"}},{"@type":"Question","name":"提交的邀请码会一直显示吗？","acceptedAnswer":{"@type":"Answer","text":"不会。邀请码有有效期，被标记已使用后一段时间会自动轮换下架，重新提交即可重新进入列表。"}}]}]}
 </script>
-<script src="/ocr/tesseract.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f8ff;color:#333;min-height:100vh;padding:20px}
@@ -1616,24 +1610,54 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .stat-num{display:block;font-size:20px;font-weight:700;color:#2563eb}
 .stat-label{font-size:11px;color:#64748b;margin-top:3px}
 
-/* 输入区 */
-.input-area{text-align:center;margin:10px 0 25px;display:flex;justify-content:center;gap:12px;align-items:center}
-.input-area input{width:240px;height:44px;font-size:16px;padding:0 16px;border:2px solid #bfdbfe;border-radius:8px;outline:none;box-sizing:border-box;text-align:center;letter-spacing:2px}
-.input-area input:focus{border-color:#3b82f6}
-.submit-btn{background:linear-gradient(135deg,#3b82f6,#60a5fa);color:#fff;border:none;height:44px;padding:0 24px;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;box-shadow:0 4px 12px rgba(59,130,246,.3);transition:all .2s ease;display:inline-flex;align-items:center;justify-content:center;min-width:120px;box-sizing:border-box}
-.submit-btn:hover{transform:translateY(-2px)}
-.submit-btn:active{transform:scale(.96)}
-.submit-btn:disabled{opacity:.5;cursor:not-allowed}
-.action-btn{display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 24px;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;color:#fff;background:linear-gradient(135deg,#8b5cf6,#7c3aed);transition:all .2s ease;white-space:nowrap;position:relative;box-sizing:border-box;min-width:120px;box-shadow:0 4px 12px rgba(139,92,246,.3)}
-.action-btn:hover{transform:translateY(-2px)}
-.action-btn:active{transform:scale(.96)}
-.action-btn:disabled{opacity:.5;cursor:not-allowed}
+/* 输入区（识别按钮内嵌在输入框右端，提交按钮独占一行） */
+.input-area{display:flex;flex-direction:column;gap:10px;margin:10px 0 0}
+.input-with-scan{display:flex;align-items:center;height:48px;border:1.5px solid #dbeafe;border-radius:13px;background:#f8fafd;box-sizing:border-box;overflow:hidden;transition:border-color .25s ease,background .25s ease,box-shadow .25s ease}
+.input-with-scan:focus-within{border-color:#3b82f6;background:#fff;box-shadow:0 0 0 3px rgba(59,130,246,.10)}
+.input-with-scan input{flex:1;min-width:0;width:auto;height:100%;font-size:16px;padding:0 16px;border:none;background:transparent;border-radius:0;box-shadow:none;outline:none;box-sizing:border-box;letter-spacing:2px;-webkit-tap-highlight-color:transparent}
+.input-with-scan input::placeholder{letter-spacing:0;color:#9ca3af}
+.scan-btn{flex-shrink:0;height:100%;padding:0 12px;border:none;border-left:1.5px solid #dbeafe;background:#f2f7ff;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;outline:none;-webkit-tap-highlight-color:transparent;transition:background .2s ease,border-color .2s ease,transform .12s ease,box-shadow .2s ease}
+.scan-btn:hover{background:#e8efff}
+.scan-btn:active{transform:scale(.94);background:#dbe7ff;box-shadow:inset 0 1px 3px rgba(59,130,246,.18)}
+.scan-btn:focus-visible{box-shadow:inset 0 0 0 2px rgba(59,130,246,.55);background:#ebf3ff}
+.scan-btn:disabled{opacity:.6;cursor:not-allowed}
+.input-with-scan:focus-within .scan-btn{background:linear-gradient(180deg,#f1f6ff 0%,#e8efff 100%);border-left-color:rgba(59,130,246,.22)}
+.scan-text{font-size:10px;color:#3b82f6;line-height:1;font-weight:600;white-space:nowrap}
+/* 四角取景框 + 扫描线图标（纯 CSS） */
+.scan-icon{position:relative;width:17px;height:17px}
+.scan-icon::before,.scan-icon::after,.scan-core::before,.scan-core::after{content:'';position:absolute;width:5.5px;height:5.5px}
+.scan-icon::before{top:0;left:0;border-top:2px solid #3b82f6;border-left:2px solid #3b82f6;border-top-left-radius:3px}
+.scan-icon::after{bottom:0;right:0;border-bottom:2px solid #3b82f6;border-right:2px solid #3b82f6;border-bottom-right-radius:3px}
+.scan-core{position:absolute;left:0;top:0;width:100%;height:100%}
+.scan-core::before{top:0;right:0;border-top:2px solid #3b82f6;border-right:2px solid #3b82f6;border-top-right-radius:3px}
+.scan-core::after{bottom:0;left:0;border-bottom:2px solid #3b82f6;border-left:2px solid #3b82f6;border-bottom-left-radius:3px}
+.scan-line{position:absolute;left:15%;right:15%;top:50%;height:2px;margin-top:-1px;background:#3b82f6;border-radius:1px;animation:scan-move 1.6s ease-in-out infinite}
+@keyframes scan-move{0%,100%{opacity:1}50%{opacity:.35}}
+.submit-btn{width:100%;height:48px;padding:0 22px;border:none;border-radius:13px;cursor:pointer;font-size:15px;font-weight:800;color:#fff;white-space:nowrap;letter-spacing:1px;background:linear-gradient(135deg,#3b82f6,#60a5fa);box-shadow:0 5px 16px rgba(59,130,246,.32);transition:transform .15s ease,box-shadow .2s ease,opacity .2s ease}
+.submit-btn:hover{transform:translateY(-1px)}
+.submit-btn:active{transform:scale(.97)}
+.submit-btn:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-row{display:flex;gap:10px;margin:0 0 18px}
+.action-btn{flex:1;position:relative;display:inline-flex;align-items:center;justify-content:center;height:48px;border:none;border-radius:13px;cursor:pointer;font-size:14.5px;font-weight:800;color:#fff;letter-spacing:1px;background:linear-gradient(135deg,#8b5cf6,#7c3aed);box-shadow:0 5px 16px rgba(139,92,246,.28);transition:transform .15s ease,box-shadow .2s ease,opacity .2s ease}
+.action-btn:hover{transform:translateY(-1px)}
+.action-btn:active{transform:scale(.97)}
+.action-btn:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none}
+.onekey-help{position:absolute;right:10px;top:50%;transform:translateY(-50%);width:20px;height:20px;border-radius:50%;background:rgba(255,255,255,.28);color:#fff;font-size:12.5px;line-height:20px;text-align:center;cursor:pointer;font-weight:700;font-style:normal;-webkit-user-select:none;user-select:none}
+.onekey-help:active{background:rgba(255,255,255,.48)}
 
-/* 识图提取 */
-.ocr-btn{display:inline-flex;align-items:center;justify-content:center;height:44px;padding:0 24px;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;color:#fff;background:linear-gradient(135deg,#10b981,#059669);transition:all .2s ease;white-space:nowrap;box-sizing:border-box;min-width:120px;box-shadow:0 4px 12px rgba(16,185,129,.3)}
-.ocr-btn:hover{transform:translateY(-2px)}
-.ocr-btn:active{transform:scale(.96)}
-.ocr-btn:disabled{opacity:.5;cursor:not-allowed}
+/* 识别结果确认弹窗 */
+.ocr-modal{max-width:380px}
+.ocr-preview{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:10px;padding:8px;margin-bottom:12px;text-align:center}
+.ocr-preview img{display:none;max-width:100%;border-radius:6px}
+.ocr-code-row input{width:100%;height:48px;font-size:20px;font-weight:700;letter-spacing:3px;text-align:center;border:2px solid #bfdbfe;border-radius:10px;outline:none;box-sizing:border-box;color:#1e40af;background:#f8fafd}
+.ocr-code-row input:focus{border-color:#3b82f6;background:#fff}
+.ocr-tip{font-size:12.5px;color:#64748b;text-align:center;margin-top:8px;line-height:1.6}
+.ocr-tip.warn{color:#d97706}
+.ocr-actions{display:flex;gap:10px;margin-top:14px}
+.ocr-actions button{flex:1;height:44px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;transition:transform .15s ease,opacity .2s ease}
+.ocr-actions button:active{transform:scale(.97)}
+.ocr-actions .btn-ghost{background:#f1f5f9;color:#475569}
+.ocr-actions .btn-primary{background:linear-gradient(135deg,#3b82f6,#60a5fa);color:#fff;box-shadow:0 4px 12px rgba(59,130,246,.3)}
 
 /* 蜜罐 */
 .honeypot{position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden}
@@ -1698,6 +1722,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .toast.show{opacity:1}
 .toast.success{background:#07c160}
 .toast.error{background:#e53935}
+.toast.warning{background:#f59e0b}
 .loading{text-align:center;padding:20px;color:#999}
 
 @media (max-width:600px){
@@ -1706,9 +1731,7 @@ body{padding:12px}
 .card h1,.card h2{font-size:1.25em}
 .desc-text{font-size:14px;padding:11px 14px}
 .feedback-btn{font-size:13px;padding:11px 0}
-.input-area{flex-direction:column;align-items:stretch}
-.input-area input{width:100%;margin-bottom:10px}
-.submit-btn,.action-btn,.ocr-btn{width:100%;margin-bottom:10px;min-width:unset}
+.submit-btn,.action-btn{width:100%}
 .list-item{flex-direction:column;gap:10px;align-items:flex-start;font-size:16px;padding:14px 16px}
 .list-item .actions{align-self:flex-end}
 .jump-btn{padding:8px 16px;font-size:14px}
@@ -1771,14 +1794,21 @@ body{padding:12px}
       <div class="stat-item"><span class="stat-num" id="statSubmits">-</span><span class="stat-label">今日提交</span></div>
     </div>
 
-    <!-- 输入区 -->
-    <div class="input-area">
-      <input type="tel" id="codeInput" placeholder="输入8-9位邀请码" maxlength="9" inputmode="numeric" pattern="[0-9]*" oninput="this.value=this.value.replace(/\\D/g,'')">
+    <!-- 输入区：识别按钮内嵌在输入框右端；form 包住输入行，手机键盘按「前往/Go」即可提交 -->
+    <form class="input-area" id="codeForm" onsubmit="event.preventDefault(); submitCode();">
+      <div class="input-with-scan">
+        <input type="tel" id="codeInput" placeholder="输入8-9位邀请码" maxlength="9" inputmode="numeric" pattern="[0-9]*" autocomplete="off" oninput="this.value=this.value.replace(/\\D/g,'')">
+        <button type="button" class="scan-btn" id="scanBtn" title="识别截图" onclick="pickCodeImage()">
+          <span class="scan-icon"><span class="scan-core"></span><span class="scan-line"></span></span>
+          <span class="scan-text">识别截图</span>
+        </button>
+      </div>
       <input type="text" id="websiteField" style="display:none" tabindex="-1" autocomplete="off">
-      <button class="submit-btn" id="submitBtn" onclick="submitCode()">立即提交</button>
-      <button class="ocr-btn" id="ocrBtn" onclick="document.getElementById('ocrFile').click()">📷 识图提取</button>
+      <button type="submit" class="submit-btn" id="submitBtn">立即提交</button>
       <input type="file" id="ocrFile" accept="image/*" style="display:none" onchange="handleOcrFile(this)">
-      <button class="action-btn" id="smartBtn" onclick="quickUse()">🚀 智能直达</button>
+    </form>
+    <div class="btn-row">
+      <button class="action-btn" id="smartBtn" onclick="quickUse()">🚀 智能直达<span class="onekey-help" title="智能直达怎么用" onclick="event.stopPropagation(); showSmartHelp()">i</span></button>
     </div>
 
     <!-- 蜜罐：机器人会填，正常用户看不到 -->
@@ -1851,7 +1881,350 @@ body{padding:12px}
   </div>
 </div>
 
+<!-- 识别结果确认弹窗：展示裁出的码区原图 + 可编辑的码，确认后才提交 -->
+<div class="modal-mask" id="ocrModal" onclick="if(event.target===this)closeOcrModal()">
+  <div class="modal ocr-modal">
+    <button class="close-x" onclick="closeOcrModal()">×</button>
+    <h2>识别结果确认</h2>
+    <div class="ocr-preview" id="ocrPreviewWrap"><img id="ocrPreview" alt="识别到的码区"></div>
+    <div class="ocr-code-row">
+      <input type="tel" id="ocrCodeInput" maxlength="9" inputmode="numeric" pattern="[0-9]*" placeholder="8-9位数字" autocomplete="off" oninput="this.value=this.value.replace(/\\D/g,'')">
+    </div>
+    <div class="ocr-tip" id="ocrTip"></div>
+    <div class="ocr-actions">
+      <button type="button" class="btn-ghost" onclick="closeOcrModal()">取消</button>
+      <button type="button" class="btn-primary" onclick="confirmOcrCode()">确认提交</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
+
+<script>
+/* ===== 本地像素识别内核：零依赖、零模型、零网络，纯函数（可直接在 Node 里单测） ===== */
+/**
+ * PDD 邀请码本地像素识别器（零依赖、零模型、零网络）
+ * 算法：红区定位 -> Otsu 行分离 -> 列切分 -> 间隙聚类 -> 6x8 归一化 -> 模板匹配
+ * 纯函数，输入 RGBA 像素数组，可在 Node 中直接测试。
+ */
+(function (root) {
+  'use strict';
+
+  var BRIGHT = 168;      // 亮字阈值（G 通道）。实测三张真机图 p50=47 / p99.9=255，余量充足
+  var GW = 6, GH = 8;    // 归一化网格（实测 5x7~10x14 均 100%，取中间值）
+  var MAX_D1 = 0.95;     // 最高距离阈值（正样本实测 0.447~0.569）
+  var MIN_GAP = 0.06;    // 与次优类的最小间隔（正样本实测 0.183~0.294）
+
+  /* 模板：0-9 各一个 6x8 标准化栅格，由 8 种字体渲染结果取平均后导出。
+     零样本验证：对 27 个真机字形 100% 正确（含数字 6——由 rot180(真机9) 交叉印证）。 */
+  var TPL = {
+    '0': [-1.354,0.1352,1.0498,1.1045,0.3609,-1.2811,-0.0523,0.9683,-0.6129,-0.6813,0.9224,0.1182,0.8632,0.3854,-1.3899,-1.4097,0.2816,0.93,1.1976,0.1472,-1.4428,-1.4503,0.0605,1.2017,1.2107,0.1314,-1.4428,-1.454,0.056,1.197,0.9245,0.3481,-1.3944,-1.4159,0.2713,0.8991,0.1181,0.9126,-0.7125,-0.751,0.8921,0.0581,-1.2963,0.3075,1.0669,1.0481,0.267,-1.2937],
+    '1': [-1.073,-0.965,-0.6834,0.0509,0.8078,1.0558,-0.1241,0.2381,0.5486,0.8805,1.0574,1.0574,0.1994,-0.0368,-0.3693,0.3197,1.0574,1.0574,-0.8056,-0.9887,-1.0961,0.214,1.0574,1.0574,-1.162,-1.162,-1.1342,0.214,1.0574,1.0574,-1.162,-1.162,-1.1342,0.214,1.0574,1.0574,-1.162,-1.162,-1.1342,0.214,1.0574,1.0574,-1.162,-1.162,-1.1342,0.214,1.0574,1.0574],
+    '2': [-0.8523,0.5852,1.1809,1.1951,0.6106,-0.9017,0.1721,0.4647,-0.5164,-0.4128,0.9652,0.6164,-0.8405,-0.7866,-1.2076,-1.134,0.6601,0.8642,-1.2616,-1.2616,-1.2513,-0.255,1.1895,-0.0521,-1.2616,-1.1784,-0.0095,1.2117,0.2365,-1.1868,-1.1197,0.2663,1.0902,-0.1185,-1.2297,-1.2616,0.0351,1.0557,0.1278,-0.627,-0.6442,-0.6453,1.1235,1.2952,1.2677,1.2677,1.2677,1.2666],
+    '3': [-0.6579,0.8363,1.3223,1.2953,0.5523,-1.0736,-0.0329,0.2404,-0.6946,-0.2594,1.2594,0.2931,-1.1321,-1.0773,-1.2882,-0.7669,1.1525,0.2775,-1.3009,-0.6441,0.3424,1.1716,0.7932,-1.0796,-1.3009,-0.8683,-0.4209,0.1834,1.261,0.2101,-1.0105,-1.0409,-1.2855,-1.2295,0.5318,1.3986,0.3478,0.1095,-0.7715,-0.5477,0.9951,0.9206,-0.1632,0.9401,1.3012,1.2386,0.605,-0.9327],
+    '4': [-1.124,-1.124,-1.0681,0.496,0.9865,-1.0112,-1.124,-1.124,-0.2687,1.2218,0.949,-1.0112,-1.124,-0.8305,1.1162,0.4746,0.949,-1.0112,-1.0711,0.6677,0.4278,-0.2632,1.173,-0.9361,0.1025,1.0425,-0.8943,-0.2167,1.2592,-0.8348,1.36,1.1629,0.9265,1.0134,1.4019,1.0053,-0.2788,-0.2788,-0.2788,0.302,1.3059,-0.1762,-1.124,-1.124,-1.124,-0.2741,1.2592,-0.9073],
+    '5': [-0.3651,1.2625,1.2592,1.2592,1.2592,0.1409,-0.0907,1.0485,-0.5777,-0.6898,-0.6898,-0.9821,0.2036,0.9249,-0.661,-0.691,-1.0686,-1.4289,0.5038,1.1889,0.8226,0.8292,0.9005,-0.5367,-1.0079,-0.9071,-1.2039,-0.8686,0.7492,0.9381,-1.1948,-1.2133,-1.4223,-1.358,0.3876,1.2254,0.1516,0.0187,-0.8485,-0.5283,0.9698,0.4837,-0.2641,0.7823,1.1421,1.0534,0.3048,-1.2116],
+    '6': [-1.4602,-0.7131,0.4592,1.1071,0.5764,-0.9623,-0.8056,0.6594,0.1673,-0.5785,-0.4211,-0.6063,0.2158,0.6237,-0.8052,-1.1709,-1.3088,-1.4492,0.9045,0.8553,0.8338,1.0377,0.8603,-0.8154,1.1971,0.8649,-0.8655,-1.0653,0.6562,0.847,1.0367,0.3982,-1.3956,-1.466,0.0079,1.2474,0.1433,0.9469,-0.6286,-0.8831,0.7038,0.6232,-1.329,0.2079,1.0464,1.09,0.5251,-1.113],
+    '7': [1.4884,1.4896,1.4896,1.4896,1.4964,1.4755,0.0383,-0.0641,-0.2279,-0.0816,1.2892,0.5771,-0.8555,-0.8875,-0.9325,0.4551,1.226,-0.655,-0.9387,-0.9387,-0.4476,1.3105,0.1515,-0.9246,-0.9387,-0.9339,0.5772,1.111,-0.6596,-0.9387,-0.9387,-0.6266,1.2582,0.3583,-0.8798,-0.9387,-0.9387,0.0094,1.3392,-0.2812,-0.9387,-0.9387,-0.8942,0.568,1.1177,-0.6385,-0.9387,-0.9387],
+    '8': [-1.5226,0.2712,1.0862,1.0869,0.3517,-1.4525,0.0099,0.9706,-0.9509,-1.0049,0.9029,0.1044,0.0461,0.8404,-1.4537,-1.5225,0.7311,0.1291,-1.469,0.7868,0.9072,0.8667,0.8613,-1.4081,-0.1327,1.0035,-0.4577,-0.4299,0.9581,-0.0544,1.1721,0.0283,-1.7044,-1.7069,-0.1159,1.1982,0.7433,0.643,-1.11,-1.1525,0.5101,0.8106,-1.2727,0.4497,1.0607,1.0652,0.5192,-1.1928],
+    '9': [-1.2074,0.4143,1.1226,1.0839,0.2727,-1.3131,0.5324,0.8743,-0.764,-0.6268,0.8799,0.1468,1.2214,0.186,-1.4634,-1.415,0.2469,1.0115,0.8129,0.7505,-1.071,-0.9949,0.7343,1.1922,-0.8769,0.8642,1.0391,0.9118,0.8646,0.9314,-1.4643,-1.3472,-1.095,-0.8424,0.5127,0.309,-0.6229,-0.4156,-0.6587,0.0084,0.6694,-0.6356,-0.9339,0.4768,1.0899,0.5583,-0.5281,-1.4421]
+  };
+
+  /* ---------- 基础工具 ---------- */
+
+  function rowGroups(counts, threshold, minLen) {
+    var out = [], s = -1, i;
+    for (i = 0; i < counts.length; i++) {
+      if (counts[i] > threshold) {
+        if (s < 0) s = i;
+      } else if (s >= 0) {
+        if (i - 1 - s + 1 >= minLen) out.push([s, i - 1]);
+        s = -1;
+      }
+    }
+    if (s >= 0 && counts.length - 1 - s + 1 >= minLen) out.push([s, counts.length - 1]);
+    return out;
+  }
+
+  function mergeRegions(regions, gap) {
+    var out = [], i;
+    for (i = 0; i < regions.length; i++) {
+      var r = regions[i];
+      if (out.length && r[0] - out[out.length - 1][1] <= gap) {
+        out[out.length - 1][1] = r[1];
+      } else {
+        out.push([r[0], r[1]]);
+      }
+    }
+    return out;
+  }
+
+  /** 一维 Otsu：在「有字行 / 无字行」之间自动找分界 */
+  function otsu1d(vals) {
+    var i, lo = Infinity, hi = -Infinity;
+    for (i = 0; i < vals.length; i++) {
+      if (vals[i] < lo) lo = vals[i];
+      if (vals[i] > hi) hi = vals[i];
+    }
+    if (!(hi - lo >= 10)) return null;
+    var BINS = 64, hist = new Float64Array(BINS), span = hi - lo;
+    for (i = 0; i < vals.length; i++) {
+      var b = Math.floor((vals[i] - lo) / span * BINS);
+      if (b < 0) b = 0; if (b >= BINS) b = BINS - 1;
+      hist[b]++;
+    }
+    var centers = new Float64Array(BINS);
+    for (i = 0; i < BINS; i++) centers[i] = lo + span * (i + 0.5) / BINS;
+    var total = 0, sumAll = 0;
+    for (i = 0; i < BINS; i++) { total += hist[i]; sumAll += hist[i] * centers[i]; }
+    var wB = 0, sumB = 0, best = -1, bestT = null;
+    for (i = 0; i < BINS; i++) {
+      wB += hist[i];
+      if (wB === 0) continue;
+      var wF = total - wB;
+      if (wF === 0) break;
+      sumB += hist[i] * centers[i];
+      var mB = sumB / wB, mF = (sumAll - sumB) / wF;
+      var v = wB * wF * (mB - mF) * (mB - mF);
+      if (v > best) { best = v; bestT = centers[i]; }
+    }
+    return bestT;
+  }
+
+  /** 6x8 面积平均降采样 + 标准化（与生成模板时完全同一算法） */
+  function glyphFeature(bright, W, x0, x1, ya, yb) {
+    var w = x1 - x0 + 1, h = yb - ya + 1;
+    var v = new Float64Array(GW * GH);
+    var gy, gx, yy, xx;
+    for (gy = 0; gy < GH; gy++) {
+      var ry0 = ya + Math.floor(gy * h / GH);
+      var ry1 = ya + Math.floor((gy + 1) * h / GH);
+      if (ry1 <= ry0) ry1 = ry0 + 1;
+      for (gx = 0; gx < GW; gx++) {
+        var rx0 = x0 + Math.floor(gx * w / GW);
+        var rx1 = x0 + Math.floor((gx + 1) * w / GW);
+        if (rx1 <= rx0) rx1 = rx0 + 1;
+        var sum = 0, cnt = 0;
+        for (yy = ry0; yy < ry1; yy++) {
+          var off = yy * W;
+          for (xx = rx0; xx < rx1; xx++) { sum += bright[off + xx]; cnt++; }
+        }
+        v[gy * GW + gx] = cnt ? sum / cnt : 0;
+      }
+    }
+    var i, m = 0;
+    for (i = 0; i < v.length; i++) m += v[i];
+    m /= v.length;
+    var s = 0;
+    for (i = 0; i < v.length; i++) s += (v[i] - m) * (v[i] - m);
+    s = Math.sqrt(s / v.length);
+    if (s < 1e-6) s = 1e-6;
+    for (i = 0; i < v.length; i++) v[i] = (v[i] - m) / s;
+    return v;
+  }
+
+  /** 剔除簇内明显不成比例的噪点块（码带小字、抗锯齿碎片），避免把 9 位码撑成 10 块 */
+  function pruneCluster(cl) {
+    if (cl.length < 4) return cl;
+    var i, mh = 0;
+    for (i = 0; i < cl.length; i++) mh += cl[i].h;
+    mh /= cl.length;
+    var out = [];
+    for (i = 0; i < cl.length; i++) {
+      if (cl[i].h < mh * 0.45) continue;      // 高度远低于同伴 → 噪点
+      if (cl[i].w < mh * 0.15) continue;      // 宽度远低于同伴 → 碎片
+      out.push(cl[i]);
+    }
+    return out.length >= 2 ? out : cl;
+  }
+
+  /** 8~9 丛簇评分：邀请码必然是 8~9 个等高、窄体的字形 */
+  function scoreCluster(cl) {
+    var n = cl.length;
+    if (n !== 8 && n !== 9) return null;
+    var i, hs = 0;
+    for (i = 0; i < n; i++) hs += cl[i].h;
+    var mh = hs / n;
+    if (mh < 6) return null;
+    var hMin = Infinity, hMax = -Infinity;
+    for (i = 0; i < n; i++) { if (cl[i].h < hMin) hMin = cl[i].h; if (cl[i].h > hMax) hMax = cl[i].h; }
+    if (hMax - hMin > 0.25 * mh) return null;      // 必须等高
+    var ws = [];
+    for (i = 0; i < n; i++) {
+      var ar = cl[i].w / cl[i].h;
+      // 逐块宽高比：中文方块字≈0.96 会被排除；两个字符合并≈1.5 也会被排除；
+      // 数字 1 天生窄（实测 0.39），因此不再要求各块宽度彼此接近
+      if (ar < 0.18 || ar > 0.90) return null;
+      ws.push(cl[i].w);
+    }
+    var wm = 0; for (i = 0; i < n; i++) wm += ws[i]; wm /= n;
+    var wv = 0, hv = 0;
+    for (i = 0; i < n; i++) { wv += (ws[i] - wm) * (ws[i] - wm); hv += (cl[i].h - mh) * (cl[i].h - mh); }
+    return 100 - 100 * Math.sqrt(wv / n) / wm - 100 * Math.sqrt(hv / n) / mh;
+  }
+
+  function segCols(counts) {
+    var out = [], s = -1, i;
+    for (i = 0; i < counts.length; i++) {
+      if (counts[i] > 1) { if (s < 0) s = i; }
+      else if (s >= 0) { out.push([s, i - 1]); s = -1; }
+    }
+    if (s >= 0) out.push([s, counts.length - 1]);
+    return out;
+  }
+
+  function clusterByGap(items, gap) {
+    var out = [], cur = [items[0]], i;
+    for (i = 1; i < items.length; i++) {
+      if (items[i].x0 - cur[cur.length - 1].x1 > gap) { out.push(cur); cur = [items[i]]; }
+      else cur.push(items[i]);
+    }
+    out.push(cur);
+    return out;
+  }
+
+  /* ---------- 主流程 ---------- */
+
+  /**
+   * @param {Uint8ClampedArray|Uint8Array} data RGBA
+   * @param {number} W @param {number} H
+   * @returns {null|{code:string,d1:number,gap:number,box:number[],n:number}}
+   */
+  function recognize(data, W, H) {
+    var n = W * H, i, p;
+    var bright = new Uint8Array(n);
+    for (i = 0, p = 0; i < n; i++, p += 4) {
+      if (data[p + 1] > BRIGHT) bright[i] = 1;
+    }
+
+    // ---- 通道 1：红底码带（拼多多分享图）----
+    var warmRow = new Int32Array(H), y, x;
+    for (y = 0; y < H; y++) {
+      var c = 0, off = y * W;
+      for (x = 0; x < W; x++) {
+        p = (off + x) * 4;
+        var r = data[p], g = data[p + 1];
+        if (r - g > 60 && r > 150) c++;
+      }
+      warmRow[y] = c;
+    }
+    var gate = new Int32Array(H);
+    for (y = 0; y < H; y++) gate[y] = warmRow[y];
+    var res = scanRegions(bright, W, H, gate, W * 0.40, Math.max(10, Math.floor(H * 0.02)));
+    if (res) return res;
+
+    // ---- 通道 2：兜底，任意底色（裁到只剩数字、黑字白底等）----
+    var inkRow = new Int32Array(H);
+    for (y = 0; y < H; y++) {
+      var c2 = 0, off2 = y * W;
+      for (x = 0; x < W; x++) c2 += bright[off2 + x];
+      inkRow[y] = c2;
+    }
+    // 亮字占比极低时，翻转极性再试（深色字压在浅底上）
+    var darkRow = new Int32Array(H);
+    var dark = new Uint8Array(n);
+    for (i = 0, p = 0; i < n; i++, p += 4) {
+      var lum = (data[p] * 299 + data[p + 1] * 587 + data[p + 2] * 114) / 1000;
+      if (lum < 110) { dark[i] = 1; darkRow[i / W | 0]++; }
+    }
+    var anyInk = 0;
+    for (y = 0; y < H; y++) anyInk += inkRow[y];
+    if (anyInk < n * 0.0005) {
+      var res2 = scanRegions(dark, W, H, darkRow, 0, Math.max(10, Math.floor(H * 0.02)), true);
+      if (res2) return res2;
+    }
+    return null;
+  }
+
+  function scanRegions(bright, W, H, gate, gateThr, mergeGap, wholeBand) {
+    var regions = rowGroups(gate, gateThr, 10);
+    regions = mergeRegions(regions, mergeGap);
+    var best = null, i, y;
+    for (i = 0; i < regions.length; i++) {
+      var y0 = regions[i][0], y1 = regions[i][1];
+      var rowb = new Float64Array(y1 - y0 + 1);
+      for (y = y0; y <= y1; y++) {
+        var c = 0, off = y * W;
+        for (var x = 0; x < W; x++) c += bright[off + x];
+        rowb[y - y0] = c;
+      }
+      var t = otsu1d(rowb);
+      var subs;
+      if (t === null) {
+        subs = wholeBand ? [[0, rowb.length - 1]] : [];
+      } else {
+        subs = rowGroups(rowb, t, 6);
+      }
+      for (var k = 0; k < subs.length; k++) {
+        var sy0 = y0 + subs[k][0], sy1 = y0 + subs[k][1];
+        if (sy1 - sy0 < 6) continue;
+        var cols = new Int32Array(W);
+        for (y = sy0; y <= sy1; y++) {
+          var o3 = y * W;
+          for (var xx = 0; xx < W; xx++) cols[xx] += bright[o3 + xx];
+        }
+        var segs = segCols(cols), info = [], j;
+        for (j = 0; j < segs.length; j++) {
+          var x0 = segs[j][0], x1 = segs[j][1];
+          if (x1 - x0 + 1 < 3) continue;
+          var ya = -1, yb = -1;
+          for (y = sy0; y <= sy1; y++) {
+            var o4 = y * W, hit = 0;
+            for (var x2 = x0; x2 <= x1; x2++) if (bright[o4 + x2]) { hit = 1; break; }
+            if (hit) { if (ya < 0) ya = y; yb = y; }
+          }
+          if (ya < 0) continue;
+          info.push({ x0: x0, x1: x1, ya: ya, yb: yb, h: yb - ya + 1, w: x1 - x0 + 1 });
+        }
+        if (info.length < 2) continue;
+        info.sort(function (a, b) { return a.x0 - b.x0; });
+        var gaps = [];
+        for (j = 1; j < info.length; j++) gaps.push(info[j].x0 - info[j - 1].x1);
+        var gs = gaps.slice().sort(function (a, b) { return a - b; });
+        var med = gs[Math.floor(gs.length / 2)];
+        var clusters = clusterByGap(info, Math.max(med * 3, 6));
+        for (var m = 0; m < clusters.length; m++) {
+          var cpr = pruneCluster(clusters[m]);
+          var sc = scoreCluster(cpr);
+          if (sc === null) continue;
+          if (!best || sc > best.score) {
+            best = { score: sc, cl: cpr, y: [sy0, sy1], bright: bright, W: W };
+          }
+        }
+      }
+    }
+    if (!best) return null;
+
+    // ---- 逐个字形分类 ----
+    var digits = '', d1max = 0, gapMin = Infinity;
+    var cl = best.cl;
+    for (i = 0; i < cl.length; i++) {
+      var f = glyphFeature(bright, W, cl[i].x0, cl[i].x1, cl[i].ya, cl[i].yb);
+      var bestCh = null, bd = Infinity, sd = Infinity;
+      for (var d = 0; d < 10; d++) {
+        var ch = String(d), tpl = TPL[ch];
+        if (!tpl || !tpl.length) continue;
+        var acc = 0;
+        for (var q = 0; q < f.length; q++) { var diff = f[q] - tpl[q]; acc += diff * diff; }
+        var dist = Math.sqrt(acc / f.length);
+        if (dist < bd) { sd = bd; bd = dist; bestCh = ch; }
+        else if (dist < sd) { sd = dist; }
+      }
+      digits += bestCh;
+      if (bd > d1max) d1max = bd;
+      var gp = sd - bd;
+      if (gp < gapMin) gapMin = gp;
+    }
+    var box = [cl[0].x0, Math.min.apply(null, cl.map(function (g) { return g.ya; })),
+               cl[cl.length - 1].x1, Math.max.apply(null, cl.map(function (g) { return g.yb; }))];
+    return { code: digits, d1: d1max, gap: gapMin, box: box, n: cl.length,
+             confident: (d1max < MAX_D1 && gapMin > MIN_GAP) };
+  }
+
+  root.PddOcrCore = { recognize: recognize, TPL: TPL, BRIGHT: BRIGHT, GW: GW, GH: GH,
+                      MAX_D1: MAX_D1, MIN_GAP: MIN_GAP };
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
 
 <script>
 function showToast(msg, type) {
@@ -1916,7 +2289,7 @@ async function submitCode() {
     showToast('网络错误', 'error');
   } finally {
     btn.disabled = false;
-    btn.textContent = '提交';
+    btn.textContent = '立即提交';
   }
 }
 
@@ -1925,211 +2298,180 @@ function getMyUsed() {
   try { return JSON.parse(localStorage.getItem('pdd_my_used') || '[]'); } catch(e) { return []; }
 }
 
-/* ============ 识图提取（Cloudflare Workers AI 视觉模型，服务端识别） ============ */
+/* ============ 识别截图：本地像素识别（毫秒级） + 服务端 AI 兜底 ============
+   拼多多分享图里的邀请码是固定字体的受控印刷体（红底金字/青字），不必加载 OCR 模型：
+   直接「定位红区 → Otsu 行分离 → 列切分 → 间隙聚类找数字簇 → 6x8 归一化栅格比模板」，
+   全程在浏览器内存里完成，零网络、零模型、零等待。内核见上方 window.PddOcrCore。 */
 
-/** 选择图片后识别互助码（AI 或浏览器本地，按后台模式） */
+var _ocrBusy = false;
+
+/** 触发选图（内嵌识别按钮） */
+function pickCodeImage() {
+  if (_ocrBusy) return;
+  document.getElementById('ocrFile').click();
+}
+
+/** 识别按钮忙碌态 */
+function setScanBusy(busy) {
+  _ocrBusy = busy;
+  var btn = document.getElementById('scanBtn');
+  if (!btn) return;
+  btn.disabled = busy;
+  var txt = btn.querySelector('.scan-text');
+  if (txt) txt.textContent = busy ? '识别中' : '识别截图';
+}
+
+/** 图片文件 → HTMLImageElement */
+function loadImageFile(file) {
+  return new Promise(function(resolve, reject) {
+    var url = URL.createObjectURL(file);
+    var img = new Image();
+    img.onload = function() { resolve({ img: img, url: url }); };
+    img.onerror = function() { URL.revokeObjectURL(url); reject(new Error('图片加载失败')); };
+    img.src = url;
+  });
+}
+
+/** 本地像素识别：返回 {code,d1,gap,confident,preview} 或 null */
+function recognizeCodeLocally(img) {
+  if (!window.PddOcrCore) return null;
+  // 长边压到 1600 以内：保留字形细节，同时把取像素 + 识别的耗时控制在几十毫秒
+  var MAXW = 1600;
+  var scale = img.naturalWidth > MAXW ? MAXW / img.naturalWidth : 1;
+  var w = Math.max(1, Math.round(img.naturalWidth * scale));
+  var h = Math.max(1, Math.round(img.naturalHeight * scale));
+  var canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  var ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, w, h);
+  var hit = window.PddOcrCore.recognize(ctx.getImageData(0, 0, w, h).data, w, h);
+  if (!hit || !hit.code) return null;
+  hit.preview = cropPreview(ctx, hit.box, w, h);
+  return hit;
+}
+
+/** 裁出码区做成预览图（上下留 60% 余量，便于肉眼核对） */
+function cropPreview(ctx, box, W, H) {
+  try {
+    var x0 = box[0], y0 = box[1], x1 = box[2], y1 = box[3];
+    var padY = Math.round((y1 - y0 + 1) * 0.6) + 4;
+    var padX = 10;
+    var sx = Math.max(0, x0 - padX), sy = Math.max(0, y0 - padY);
+    var ex = Math.min(W, x1 + 1 + padX), ey = Math.min(H, y1 + 1 + padY);
+    var cw = ex - sx, ch = ey - sy;
+    if (cw <= 0 || ch <= 0) return null;
+    var c = document.createElement('canvas');
+    c.width = cw; c.height = ch;
+    c.getContext('2d').drawImage(ctx.canvas, sx, sy, cw, ch, 0, 0, cw, ch);
+    return c.toDataURL('image/png');
+  } catch(e) { return null; }
+}
+
+/** 选图后：本地识别优先；低置信度或没识别到时，按后台模式决定是否走 AI 兜底 */
 async function handleOcrFile(fileEl) {
   var file = fileEl.files && fileEl.files[0];
-  fileEl.value = ''; // 允许重复选择同一张图
+  fileEl.value = '';   // 允许重复选择同一张图
   if (!file) return;
+  if (file.size > 4 * 1024 * 1024) { showToast('图片太大，请选小于 4MB 的截图', 'error'); return; }
 
-  // 限制图片大小（4MB）
-  if (file.size > 4 * 1024 * 1024) {
-    showToast('图片太大，请选小于 4MB 的截图', 'error');
-    return;
-  }
-
-  var btn = document.getElementById('ocrBtn');
-  var input = document.getElementById('codeInput');
-  var oldText = btn.textContent;
-  btn.disabled = true;
-
-  // 后台模式：ai = 直接走服务端 AI；local/auto（默认）= 浏览器本地优先
-  var mode = window._ocrMode || 'local';
+  setScanBusy(true);
+  var url = null, hit = null;
   try {
-    if (mode === 'ai') {
-      return await aiOcr(file, btn, input);
-    }
-    // 本地优先
-    btn.textContent = '本地识别中...';
-    var code = await runLocalOcr(file, btn);
-    if (code) {
-      fillOcrResult(input, code);
+    var loaded = await loadImageFile(file);
+    url = loaded.url;
+
+    var t0 = Date.now();
+    hit = recognizeCodeLocally(loaded.img);
+    var ms = Date.now() - t0;
+
+    if (hit && hit.code && hit.confident) {
+      openOcrModal(hit.code, hit.preview, '本地识别完成 · ' + ms + 'ms', true);
       return;
     }
-    // 本地未识别到：弹窗让用户选「用 AI 识别」或「手动输入」
-    var choice = await showOcrFallbackDialog();
-    if (choice === 'ai') {
-      return await aiOcr(file, btn, input);
+    // 本地没拿到或置信度偏低：只有后台开了 AI 模式才调服务端识图（省额度）
+    if ((window._ocrMode || 'local') === 'ai') {
+      var aiCode = await aiOcr(file);
+      if (aiCode) { openOcrModal(aiCode, hit ? hit.preview : null, 'AI 识别完成', true); return; }
     }
-    showToast('请手动输入互助码', 'error');
+    if (hit && hit.code) {   // 本地有结果但不够确定，交给用户人工核对
+      openOcrModal(hit.code, hit.preview, '本地识别置信度偏低，请核对后提交', false);
+      return;
+    }
+    showToast('没识别到邀请码，请手动输入', 'error');
+    document.getElementById('codeInput').focus();
   } catch(e) {
-    showToast('识别出错，请手动输入互助码', 'error');
+    console.error('识别失败:', e);
+    showToast('识别出错，请手动输入邀请码', 'error');
   } finally {
-    btn.disabled = false;
-    btn.textContent = oldText;
+    if (url) URL.revokeObjectURL(url);
+    setScanBusy(false);
   }
 }
 
-/** 调用服务端 AI 识别（?force=ai 保证走 AI 路径） */
-async function aiOcr(file, btn, input) {
-  btn.textContent = 'AI 识别中...';
-  var formData = new FormData();
-  formData.append('image', file);
-  var res = await fetch('/api/ocr?force=ai', { method: 'POST', body: formData });
-  var data = await res.json();
-  if (data.success && data.code) {
-    fillOcrResult(input, data.code);
-  } else if (data.fallback === 'local') {
-    showToast('AI 识别受限，请手动输入互助码', 'error');
-  } else {
-    showToast(data.error || 'AI 识别失败，请手动输入互助码', 'error');
-  }
-}
-
-/** 把识别结果填入输入框并提示 */
-function fillOcrResult(input, code) {
-  input.value = code;
-  if (code.length >= 8 && code.length <= 9) {
-    showToast('识别成功：' + code + '，请确认后提交', 'success');
-  } else {
-    showToast('识别到 ' + code + '（长度' + code.length + '位），请核对后提交', 'warning');
-  }
-  input.focus();
-}
-
-/** 浏览器本地 OCR（tesseract.js + 红底白字预处理），返回识别到的码或 null */
-var _ocrWorker = null;
-async function runLocalOcr(file, btn) {
-  if (!window.Tesseract) {
-    showToast('本地识别组件未加载，请手动输入互助码', 'error');
-    return null;
-  }
-  if (!_ocrWorker) {
-    btn.textContent = '加载识别模型(首次约15秒)...';
-    try {
-      // 全部同域自托管（/ocr/，Worker Assets 静态资源），无 CORS 依赖、无第三方 CDN 速度问题
-      // 训练数据为 best_int 整数版（2.95MB，质量接近 best 全量 12.8MB）
-      _ocrWorker = await Tesseract.createWorker('eng', 1, {
-        langPath: '/ocr',
-        workerPath: '/ocr/worker.min.js',
-        corePath: '/ocr',
-        workerBlobURL: false
-      });
-      await _ocrWorker.setParameters({ tessedit_char_whitelist: '0123456789' });
-    } catch(e) {
-      console.error('本地识别模型加载失败:', e);
-      showToast('本地识别模型加载失败，请手动输入或改用 AI', 'error');
-      return null;
-    }
-  }
-  btn.textContent = '本地识别中...';
+/** 服务端 AI 识图（/api/ocr?force=ai），成功返回码，失败返回 null */
+async function aiOcr(file) {
   try {
-    var canvas = await preprocessImageForOcr(file);
-    var result = await _ocrWorker.recognize(canvas);
-    var rawText = result.data.text || '';
-    return extractCodeFromText(rawText);
+    var formData = new FormData();
+    formData.append('image', file);
+    var res = await fetch('/api/ocr?force=ai', { method: 'POST', body: formData });
+    var data = await res.json();
+    if (data.success && data.code) return data.code;
+    if (data.fallback === 'local') showToast('AI 识图未开启，请手动输入', 'error');
+    else showToast(data.error || 'AI 识别失败，请手动输入', 'error');
+    return null;
   } catch(e) {
-    console.error('本地识别出错:', e);
-    showToast('本地识别出错：' + (e && e.message ? e.message : '未知错误'), 'error');
+    showToast('AI 识别请求失败，请手动输入', 'error');
     return null;
   }
 }
 
-/** 本地识别失败后的选择弹窗：返回 'ai' 或 'manual' */
-function showOcrFallbackDialog() {
-  return new Promise(function(resolve) {
-    var overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:9999;';
-    var box = document.createElement('div');
-    box.style.cssText = 'background:#fff;border-radius:12px;padding:24px;max-width:320px;width:86%;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.2);';
-    var title = document.createElement('div');
-    title.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:6px;';
-    title.textContent = '本地未识别到互助码';
-    var sub = document.createElement('div');
-    sub.style.cssText = 'font-size:13px;color:#666;margin-bottom:18px;';
-    sub.textContent = '可改用 AI 识别，或直接手动输入互助码';
-    var aiBtn = document.createElement('button');
-    aiBtn.textContent = '用 AI 识别';
-    aiBtn.style.cssText = 'display:block;width:100%;padding:11px;margin-bottom:10px;border:none;border-radius:8px;background:#ff5000;color:#fff;font-size:14px;cursor:pointer;';
-    var manualBtn = document.createElement('button');
-    manualBtn.textContent = '手动输入';
-    manualBtn.style.cssText = 'display:block;width:100%;padding:11px;border:1px solid #ddd;border-radius:8px;background:#fff;color:#333;font-size:14px;cursor:pointer;';
-    aiBtn.onclick = function () { document.body.removeChild(overlay); resolve('ai'); };
-    manualBtn.onclick = function () { document.body.removeChild(overlay); resolve('manual'); };
-    box.appendChild(title); box.appendChild(sub); box.appendChild(aiBtn); box.appendChild(manualBtn);
-    overlay.appendChild(box);
-    document.body.appendChild(overlay);
-  });
+/* ---------- 识别结果确认弹窗 ---------- */
+
+/** 打开确认弹窗：展示裁出的码区原图 + 可编辑的码 */
+function openOcrModal(code, preview, tip, confident) {
+  var img = document.getElementById('ocrPreview');
+  if (preview) { img.src = preview; img.style.display = 'block'; }
+  else { img.removeAttribute('src'); img.style.display = 'none'; }
+  document.getElementById('ocrCodeInput').value = code || '';
+  var tipEl = document.getElementById('ocrTip');
+  tipEl.textContent = tip || '';
+  tipEl.className = 'ocr-tip' + (confident ? '' : ' warn');
+  openModal('ocrModal');
+  var inp = document.getElementById('ocrCodeInput');
+  setTimeout(function() { inp.focus(); inp.select(); }, 60);
 }
 
-/** 红底白字 → 黑字白底预处理（拼多多分享图），提升数字识别率 */
-function preprocessImageForOcr(file) {
-  return new Promise(function(resolve, reject) {
-    var img = new Image();
-    img.onload = function() {
-      try {
-        var scale = 2;
-        var w = img.naturalWidth * scale, h = img.naturalHeight * scale;
-        if (w > 3000) { var r = 3000 / w; w = Math.round(3000); h = Math.round(h * r); }
-        var canvas = document.createElement('canvas');
-        canvas.width = w; canvas.height = h;
-        var ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0, w, h);
-        var imgData = ctx.getImageData(0, 0, w, h);
-        var d = imgData.data;
-        for (var i = 0; i < d.length; i += 4) {
-          var r = d[i], g = d[i + 1], b = d[i + 2];
-          var isRed = r > 150 && (r - g) > 40 && (r - b) > 40;
-          var isWhite = r > 200 && g > 200 && b > 200;
-          var v;
-          if (isRed) v = 255;
-          else if (isWhite) v = 0;
-          else {
-            var lum = 0.299 * r + 0.587 * g + 0.114 * b;
-            v = lum > 180 ? 0 : 255;
-          }
-          d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
-        }
-        ctx.putImageData(imgData, 0, 0);
-        resolve(canvas);
-      } catch (err) { reject(err); }
-    };
-    img.onerror = function() { reject(new Error('图片加载失败')); };
-    img.src = URL.createObjectURL(file);
-  });
+function closeOcrModal() { closeModal('ocrModal'); }
+
+/** 弹窗里点「确认提交」：校验后写入主输入框并提交 */
+function confirmOcrCode() {
+  var code = (document.getElementById('ocrCodeInput').value || '').trim();
+  if (!/^[0-9]{8,9}$/.test(code)) { showToast('请输入 8-9 位数字邀请码', 'error'); return; }
+  closeOcrModal();
+  document.getElementById('codeInput').value = code;
+  submitCode();
 }
 
-/** 从文本中提取连续 8/9 位数字（兜底取最长 6-12 位）
- *  注意：这段代码在 INDEX_HTML 模板里，不能写 \d 等正则转义，会被模板吞掉反斜杠。
- */
-function extractCodeFromText(text) {
-  var s = String(text || '');
-  var runs = [];
-  var cur = '';
-  for (var i = 0; i < s.length; i++) {
-    var c = s.charAt(i);
-    if (c >= '0' && c <= '9') {
-      cur += c;
-    } else if (cur.length) {
-      runs.push(cur);
-      cur = '';
-    }
-  }
-  if (cur.length) runs.push(cur);
-
-  // 优先取 8-9 位数字串
-  for (var j = 0; j < runs.length; j++) {
-    var len = runs[j].length;
-    if (len >= 8 && len <= 9) return runs[j];
-  }
-
-  // 兜底：最长 6-12 位数字串
-  if (runs.length) {
-    var longest = runs.reduce(function(a, b) { return b.length > a.length ? b : a; });
-    if (longest.length >= 6 && longest.length <= 12) return longest;
-  }
-  return null;
+/** 「智能直达」右端 ⓘ 帮助 */
+function showSmartHelp() {
+  var overlay = document.createElement('div');
+  overlay.className = 'modal-mask show';
+  overlay.innerHTML = '<div class="modal">' +
+    '<button class="close-x" onclick="this.parentNode.parentNode.remove()">×</button>' +
+    '<h2>🚀 智能直达 怎么用</h2>' +
+    '<p style="font-size:14px;line-height:1.85;color:#374151;margin:0 0 10px">' +
+    '点一下「智能直达」，系统会自动挑一个<b>还没被用过的最新互助码</b>并打开拼多多的搜索页完成助力，不用自己在列表里翻、也不用手动复制粘贴。' +
+    '</p>' +
+    '<p style="font-size:14px;line-height:1.85;color:#374151;margin:0 0 10px">' +
+    '<b>注意：</b>跳转前请先手动从拼多多首页进入福袋活动界面（首页 → 百亿补贴 → 百亿消费券 → 福袋），否则组队会失败。' +
+    '</p>' +
+    '<p style="font-size:13px;line-height:1.8;color:#6b7280;margin:0 0 14px">' +
+    '另外：互助码如果在截图里，直接点输入框右侧的「识别截图」即可，不用手打。' +
+    '</p>' +
+    '<button class="modal-ok" onclick="this.parentNode.parentNode.remove()">知道了</button>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
 }
 
 /** 记录自己用过的码 id */
@@ -2506,7 +2848,7 @@ async function loadConfig() {
       iosBtn.style.display = 'none';
     }
 
-    // OCR 模式：存全局，识图时决定用 AI 还是浏览器本地
+    // 识图模式：存全局，本地识别没成功时决定是否自动走服务端 AI 兜底
     window._ocrMode = (cfg.ocr_mode === 'ai') ? 'ai' : 'local';
   } catch(e) {
     // 配置加载失败静默处理，不影响主功能
@@ -2707,12 +3049,12 @@ tr:hover{background:#fafafa}
         <div class="hint">限制同一 IP 每天最多提交次数，范围 1-2000，默认 30。</div>
       </div>
       <div class="form-group">
-        <label>识图提取模式</label>
+        <label>识别截图模式</label>
         <select id="ocrModeInput" style="width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:8px;font-size:14px">
-          <option value="local">浏览器本地优先（默认，不消耗 AI 额度）</option>
-          <option value="ai">仅服务端 AI（额度用完提示手动输入）</option>
+          <option value="local">仅本地识别（默认，秒出、不消耗 AI 额度）</option>
+          <option value="ai">本地识别 + AI 兜底（本地没识别到时自动调服务端 AI）</option>
         </select>
-        <div class="hint">本地优先：选图后先用浏览器本地识别（首次需下载组件约 10MB），失败会弹窗让你选「用 AI 识别」或「手动输入」。设为「仅 AI」则不走本地、直接调用服务端识别。</div>
+        <div class="hint">识别截图不加载任何模型：选图后先在浏览器里做像素模板匹配（毫秒级、零网络）。选「本地识别 + AI 兜底」时，本地没识别到或置信度偏低会自动调用服务端 AI 识图（消耗 Workers AI 额度，每 IP 每分钟限 10 次）。</div>
       </div>
     </div>
     <div style="margin-bottom:20px">
