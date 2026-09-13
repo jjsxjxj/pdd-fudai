@@ -494,25 +494,33 @@ function fillLocationAsync(db, ctx, ip, code) {
   if (!ctx || !ctx.waitUntil) return;
   ctx.waitUntil((async () => {
     try {
+      // IPv6 与私网地址外部库都不支持，别白跑 10 秒（每个源各 5s 超时）
+      if (!isQueryableIP(ip)) return;
       const cacheKey = 'https://iploc-cache.local/' + ip;
-      let loc = '';
       const hit = await caches.default.match(cacheKey);
       if (hit) {
-        loc = await hit.text();
-      } else {
-        loc = await fetchIPLocation(ip);
-        if (loc) {
-          await caches.default.put(cacheKey, new Response(loc, {
-            headers: { 'Cache-Control': 'public, max-age=600' },
-          }));
-        }
-      }
-      if (loc) {
+        const loc = await hit.text();
+        // 缓存里空串 = 之前查过但没结果（负缓存），直接放弃
+        if (!loc) return;
         await db
           .prepare('UPDATE codes SET location = ? WHERE code = ? AND ip = ?')
           .bind(loc, code, ip)
           .run();
+        return;
       }
+      const loc = await fetchIPLocation(ip);
+      // 无论成功失败都写缓存：成功 10 分钟，失败也 10 分钟
+      // （原来只缓存成功结果，失败时每次提交都要重跑两个 IPv4 库，白耗配额）
+      await caches.default.put(cacheKey, new Response(loc || '', {
+        headers: { 'Cache-Control': 'public, max-age=600' },
+      }));
+      if (!loc) return;
+      // 只在拿到「更详细」的结果时才覆盖：同步兜底已给出中文城市时，
+      // 外部接口若只返回同级信息就不必改写（避免反复写库）
+      await db
+        .prepare('UPDATE codes SET location = ? WHERE code = ? AND ip = ?')
+        .bind(loc, code, ip)
+        .run();
     } catch {}
   })());
 }
@@ -742,7 +750,7 @@ function translateISP(isp) {
  *  注意：ip 必须 encodeURIComponent 后再拼 URL —— 后台手动拉黑时 ip 来自管理员输入，
  *  未编码的特殊字符可篡改 query 结构。 */
 async function fetchIPLocation(ip) {
-  if (!ip || ip === '0.0.0.0') return '';
+  if (!isQueryableIP(ip)) return '';
   const q = encodeURIComponent(ip);
 
   // 方案1：百度开放数据 API（HTTPS，中文）
@@ -787,21 +795,79 @@ async function fetchIPLocation(ip) {
 /** 获取IP归属地（中文优先：百度 API 异步，request.cf 同步兜底）
  *  提交接口用同步版（不阻塞响应），后台手动拉黑用异步版
  */
+/** Cloudflare 地名（英文）→ 中文。cf.city / cf.region 是固定的英文取值集合，
+ *  本地映射即可覆盖国内绝大多数访问，不必依赖外部 IPv4-only 接口。 */
+const CN_CITY = {
+  // 直辖市
+  Shanghai: '上海', Beijing: '北京', Tianjin: '天津', Chongqing: '重庆',
+  // 省会 / 主要城市
+  Guangzhou: '广州', Shenzhen: '深圳', Hangzhou: '杭州', Nanjing: '南京', Suzhou: '苏州',
+  Wuhan: '武汉', Chengdu: '成都', Xian: '西安', "Xi'an": '西安', Zhengzhou: '郑州',
+  Changsha: '长沙', Qingdao: '青岛', Ningbo: '宁波', Wuxi: '无锡', Xiamen: '厦门',
+  Fuzhou: '福州', Jinan: '济南', Hefei: '合肥', Kunming: '昆明', Nanning: '南宁',
+  Guiyang: '贵阳', Nanchang: '南昌', Taiyuan: '太原', Shijiazhuang: '石家庄',
+  Shenyang: '沈阳', Dalian: '大连', Changchun: '长春', Harbin: '哈尔滨',
+  Lanzhou: '兰州', Xining: '西宁', Yinchuan: '银川', Urumqi: '乌鲁木齐',
+  Hohhot: '呼和浩特', Haikou: '海口', Sanya: '三亚', Dongguan: '东莞', Foshan: '佛山',
+  Wenzhou: '温州', Jiaxing: '嘉兴', Shaoxing: '绍兴', Jinhua: '金华', Taizhou: '台州',
+  Changzhou: '常州', Xuzhou: '徐州', Nantong: '南通', Yantai: '烟台', Weifang: '潍坊',
+  Zibo: '淄博', Tangshan: '唐山', Baoding: '保定', Luoyang: '洛阳', Xiangyang: '襄阳',
+  Zhuhai: '珠海', Zhongshan: '中山', Huizhou: '惠州', Shantou: '汕头', Zhanjiang: '湛江',
+  Guilin: '桂林', Liuzhou: '柳州', Mianyang: '绵阳', Zunyi: '遵义', Baoji: '宝鸡',
+  Datong: '大同', Linfen: '临汾', Xianyang: '咸阳', Kaifeng: '开封', Xinxiang: '新乡',
+  Anyang: '安阳', Yangzhou: '扬州', Zhenjiang: '镇江', Yancheng: '盐城',
+  HuaiAn: '淮安', "Huai'an": '淮安', Lianyungang: '连云港', Taian: '泰安', "Tai'an": '泰安',
+  Jining: '济宁', Linyi: '临沂', Dezhou: '德州', Liaocheng: '聊城',
+};
+const CN_REGION = {
+  Shanghai: '上海', Beijing: '北京', Tianjin: '天津', Chongqing: '重庆',
+  Guangdong: '广东', Zhejiang: '浙江', Jiangsu: '江苏', Shandong: '山东',
+  Henan: '河南', Sichuan: '四川', Hubei: '湖北', Hunan: '湖南', Fujian: '福建',
+  Anhui: '安徽', Hebei: '河北', Shanxi: '山西', Shaanxi: '陕西', Liaoning: '辽宁',
+  Jilin: '吉林', Heilongjiang: '黑龙江', Jiangxi: '江西', Yunnan: '云南',
+  Guizhou: '贵州', Guangxi: '广西', Gansu: '甘肃', Qinghai: '青海',
+  Ningxia: '宁夏', Xinjiang: '新疆', Xizang: '西藏', Tibet: '西藏',
+  Hainan: '海南', 'Nei Mongol': '内蒙古', 'Inner Mongolia': '内蒙古',
+};
+
+function cnName(v, table) {
+  if (!v) return '';
+  if (/[\u4e00-\u9fa5]/.test(v)) return v;   // 已是中文
+  return table[v] || '';
+}
+
+/** 获取IP归属地（同步，纯本地计算，零网络零耗时）
+ *  request.cf 的地名是英文，这里本地映射为中文；映射不到时保留原文（由异步链路兜底补全）。 */
 function getIPLocationSync(request) {
   try {
     const cf = request.cf;
     if (!cf) return '';
     const parts = [];
-    if (cf.city) parts.push(cf.city);
-    else if (cf.region) parts.push(cf.region);
+    // 城市优先；城市映射不到就退回省份；都映射不到才用英文原名
+    const city = cnName(cf.city, CN_CITY);
+    const region = cnName(cf.region, CN_REGION);
+    const cityRaw = cf.city || '';
+    if (city) parts.push(city);
+    else if (region) parts.push(region);
+    else if (cityRaw) parts.push(cityRaw);
     // ISP 英文→中文翻译
     const ispCn = translateISP(cf.asOrganization || '');
     if (ispCn) parts.push(ispCn);
-    else if (cf.asOrganization) parts.push(cf.asOrganization);
+    else if (cf.asOrganization && !parts.length) parts.push(cf.asOrganization);
     return parts.join(' ').trim();
   } catch {
     return '';
   }
+}
+
+/** 该 IP 是否值得送去外部接口查询：IPv6 与私网/保留地址一律跳过
+ *  （百度 opendata 与 ipwho.is 均为 IPv4 库，对 IPv6 分别返回空数组 / 限流报错） */
+function isQueryableIP(ip) {
+  if (!ip || ip === '0.0.0.0' || ip === '::' || ip === '::1') return false;
+  if (ip.indexOf(':') >= 0) return false;                     // IPv6
+  if (/^10\./.test(ip) || /^192\.168\./.test(ip) || /^127\./.test(ip)) return false;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return false;
+  return true;
 }
 
 // ============================================================
@@ -1637,7 +1703,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .submit-btn:hover{transform:translateY(-1px)}
 .submit-btn:active{transform:scale(.97)}
 .submit-btn:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none}
-.btn-row{display:flex;gap:10px;margin:0 0 18px}
+.btn-row{display:flex;gap:10px;margin:10px 0 18px}
 .action-btn{flex:1;position:relative;display:inline-flex;align-items:center;justify-content:center;height:48px;border:none;border-radius:13px;cursor:pointer;font-size:14.5px;font-weight:800;color:#fff;letter-spacing:1px;background:linear-gradient(135deg,#8b5cf6,#7c3aed);box-shadow:0 5px 16px rgba(139,92,246,.28);transition:transform .15s ease,box-shadow .2s ease,opacity .2s ease}
 .action-btn:hover{transform:translateY(-1px)}
 .action-btn:active{transform:scale(.97)}
