@@ -2,7 +2,7 @@
 
 基于 Cloudflare Workers + D1 数据库的拼多多福袋邀请码互助平台。
 
-**线上地址**: 部署到 Cloudflare 后，用你自己的域名访问即可
+**线上地址**: https://fudai.10087.eu.org （演示站；部署到 Cloudflare 后，用你自己的域名访问即可）
 
 **部署教程**: [Cloudflare Workers 部署指南 - 我的博客](https://813146.xyz/post/deploy-cloudflare-workers-via-dashboard)
 
